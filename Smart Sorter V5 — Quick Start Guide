@@ -1,0 +1,181 @@
+⚡ Smart Sorter V5 — Quick Start Guide
+This guide gets you from zero to fully running Smart Sorter V5 in just a few minutes.
+
+🧩 1. Install Requirements
+Install Python 3.10+
+Then install dependencies:
+
+Code
+pip install pymupdf python-docx pillow numpy
+Optional but recommended:
+
+Code
+pip install opencv-python
+If using Google Vision OCR:
+
+Code
+pip install google-cloud-vision
+📁 2. Create Required Folders
+Create the Smart Inbox root:
+
+Code
+C:/SmartInbox/
+C:/SmartInbox/System/
+Create your incoming folders:
+
+Code
+C:/SmartInboxLocal/Incoming/Downloads
+C:/SmartInboxLocal/Incoming/Scans
+C:/SmartInboxLocal/Incoming/OtherSources
+C:/SmartInboxLocal/Incoming/PhoneLink
+Your OneDrive folders already exist in your config.
+
+⚙️ 3. Add Your config.json
+Place your updated config.json here:
+
+Code
+C:/SmartInbox/config.json
+This file defines:
+
+Predefined category folders
+
+Dynamic category root (sorted_root)
+
+Photo/video roots
+
+AI settings
+
+Watched folders
+
+🧠 4. Add Your API Keys
+Gemini
+Inside config.json:
+
+Code
+"api_key": "YOUR_GEMINI_KEY"
+Google Vision (optional)
+Set environment variable:
+
+Code
+GOOGLE_APPLICATION_CREDENTIALS="C:/path/to/vision-key.json"
+📦 5. Place Smart Sorter Files
+Put these files in the same folder:
+
+Code
+smart_sorter_v5.py
+filename_router.py
+ai_classifier.py
+smart_mode_v2.py
+gemini_engine.py
+metadata_enhancer.py
+onedrive_safe_watcher.py
+v3_debug_dashboard.py
+▶️ 6. Run Smart Sorter V5
+Start the sorter:
+
+Code
+python smart_sorter_v5.py
+You’ll see:
+
+Code
+Smart Sorter V5 is running. Press Ctrl+C to stop.
+🖥 7. Open the Debug Dashboard
+Visit:
+
+Code
+http://localhost:8765
+You’ll see:
+
+Original filename
+
+AI category
+
+Smart Mode category
+
+Final filename
+
+Routing destination
+
+Metadata
+
+Reasoning
+
+📥 8. Drop Files Into Watched Folders
+Place files into:
+
+Downloads
+
+Scans
+
+PhoneLink
+
+OneDrive Camera
+
+Meta AI
+
+Smart Sorter will:
+
+Detect the file
+
+Wait for OneDrive stability
+
+Classify with Gemini
+
+Refine with Smart Mode V2
+
+Generate a clean filename
+
+Route to the correct folder
+
+Log the event in the dashboard
+
+📂 9. Verify Output
+Sorted files appear under:
+
+Code
+Sorted/<Category>/
+Photos/videos appear under:
+
+Code
+Photos/YYYY/MM/
+Videos/YYYY/MM/
+New categories appear automatically under:
+
+Code
+Sorted/<NewCategory>/
+🧪 10. Test the System
+Try dropping:
+
+A bank statement
+
+A medical bill
+
+A random screenshot
+
+A photo from your phone
+
+A PDF with tables
+
+A resume
+
+A subscription receipt
+
+Watch Smart Sorter:
+
+Detect
+
+Classify
+
+Rename
+
+Route
+
+Log
+
+All in real time.
+
+🛠 11. Stop the Sorter
+Press:
+
+Code
+Ctrl + C
