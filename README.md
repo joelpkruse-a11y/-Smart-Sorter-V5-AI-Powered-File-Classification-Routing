@@ -1,2 +1,305 @@
-# -Smart-Sorter-V5-AI-Powered-File-Classification-Routing
-Automated Document, Photo &amp; Video Organization Using Gemini + Smart Mode V2
+# Smart Sorter V5  
+AI‑Powered Document, Photo, and Video Classification & Routing System  
+Author: Joel Kruse
+
+---
+
+## 📌 Overview
+
+Smart Sorter V5 is an intelligent, automated file‑sorting system designed to classify, rename, and route documents, photos, and videos into a clean, self‑organizing folder structure.
+
+It uses:
+
+- **Gemini 2.5 Pro** for strict, structured document understanding  
+- **Smart Mode V2** for deterministic category refinement  
+- **Google Vision OCR** for document‑photo detection  
+- **Dynamic routing** for new categories  
+- **Date‑based routing** for photos and videos  
+- **OneDrive‑safe file watching**  
+- **A real‑time debug dashboard**  
+
+Smart Sorter V5 is built for reliability, clarity, and long‑term maintainability.
+
+---
+
+## 🚀 Key Features
+
+### **1. AI‑Powered Classification**
+- Gemini 2.5 Pro performs structured extraction:
+  - Category  
+  - Confidence  
+  - Metadata  
+  - Tables  
+  - Reasoning  
+  - Clean filename suggestion  
+
+### **2. Smart Mode V2**
+A deterministic refinement layer that:
+- Normalizes categories  
+- Corrects ambiguous classifications  
+- Forces review when confidence is low  
+
+### **3. Clean Filename Rules**
+Smart Sorter V5 applies strict, predictable filename rules:
+
+| Category Type | Filename Format |
+|---------------|-----------------|
+| **Photos** | `YYYY-MM-DD BaseName.ext` |
+| **Videos** | `BaseName.ext` |
+| **Other** | `BaseName.ext` |
+| **Meaningful Categories** | `Category - BaseName.ext` |
+
+No double extensions.  
+No category pollution for photos/videos/other.  
+No dates except for photos.
+
+### **4. Dynamic Folder Creation**
+If a category is **not** predefined in config.json, Smart Sorter creates:
+
+```
+Sorted/<NewCategory>/
+```
+
+Example:
+```
+Sorted/Personal credentials/
+Sorted/Identity documents/
+Sorted/Eyecare/
+```
+
+### **5. Date‑Based Routing for Photos & Videos**
+Photos and videos are routed to:
+
+```
+Photos/YYYY/MM/
+Videos/YYYY/MM/
+```
+
+### **6. OneDrive‑Safe File Handling**
+- Waits for file stability  
+- Retries locked files  
+- Avoids race conditions  
+
+### **7. Real‑Time Debug Dashboard**
+Runs on:
+```
+http://localhost:8765
+```
+
+Shows:
+- Original filename  
+- AI category  
+- Smart Mode category  
+- Final filename  
+- Metadata  
+- Reasoning  
+- Routing destination  
+
+---
+
+## 📁 Folder Structure
+
+Example final structure:
+
+```
+Sorted/
+│
+├── Finance/
+├── Insurance/
+├── Medical/
+├── Legal/
+├── Taxes/
+├── Personal/
+│   ├── Subscriptions/
+│   └── Warranties/
+│
+├── Photos/
+│   └── 2024/
+│       └── 02/
+│
+├── Videos/
+│   └── 2024/
+│       └── 02/
+│
+├── Review/
+│
+└── <New Dynamic Categories Created Automatically>
+    ├── Personal credentials/
+    ├── Identity documents/
+    ├── Auto insurance/
+    └── Eyecare/
+```
+
+---
+
+## ⚙️ Configuration (config.json)
+
+Key sections:
+
+### **destinations**
+Defines:
+- Predefined category folders  
+- Photos/videos roots  
+- Review folder  
+- Dynamic category root (`sorted_root`)  
+
+### **classification**
+Defines file extensions for:
+- Photos  
+- Videos  
+- Documents  
+
+### **ai_classification**
+Controls:
+- Gemini model  
+- Google Vision OCR  
+- Ollama fallback  
+
+### **observer_groups**
+Defines watched folders:
+- Downloads  
+- Scans  
+- PhoneLink  
+- OneDrive Camera  
+- Meta AI folder  
+
+### **initial_scan_groups**
+Folders scanned once at startup.
+
+---
+
+## 🔄 Processing Pipeline
+
+1. **File detected** by OneDrive‑safe watcher  
+2. **File readiness check** (size stability)  
+3. **Document‑photo detection** (OCR + heuristics)  
+4. **Gemini structured classification**  
+5. **Smart Mode V2 refinement**  
+6. **Filename generation** (strict rules)  
+7. **Routing** (predefined or dynamic)  
+8. **Move with retry**  
+9. **Dashboard event logged**  
+
+---
+
+## 🧠 Filename Rules (Detailed)
+
+### **Photos**
+- Extract date from:
+  1. EXIF  
+  2. Metadata  
+  3. Filesystem timestamp  
+- Format:
+```
+YYYY-MM-DD BaseName.ext
+```
+
+### **Videos**
+```
+BaseName.ext
+```
+
+### **Other**
+```
+BaseName.ext
+```
+
+### **Meaningful Categories**
+```
+Category - BaseName.ext
+```
+
+---
+
+## 🗂 Dynamic Category Creation
+
+If Gemini returns a category not listed in config.json:
+
+```
+Sorted_root/<CategoryName>/
+```
+
+Example:
+```
+Sorted/Employment verification/
+Sorted/Identity documents/
+Sorted/Medical forms/
+```
+
+---
+
+## 🛠 Requirements
+
+- Python 3.10+  
+- fitz (PyMuPDF)  
+- python-docx  
+- Pillow  
+- numpy  
+- OpenCV (optional)  
+- Google Vision API (optional)  
+- Gemini API key  
+- OneDrive installed (optional but recommended)  
+
+---
+
+## ▶️ Running Smart Sorter V5
+
+Run:
+
+```
+python smart_sorter_v5.py
+```
+
+Dashboard starts automatically at:
+
+```
+http://localhost:8765
+```
+
+---
+
+## 🧪 Testing
+
+Drop files into any watched folder:
+
+- Downloads  
+- Scans  
+- PhoneLink  
+- OneDrive Camera  
+- Meta AI  
+
+Watch them appear in:
+
+```
+Sorted/<Category>/
+```
+
+With clean filenames and correct routing.
+
+---
+
+## 🧩 Troubleshooting
+
+### File stuck in place  
+Likely OneDrive lock → sorter retries automatically.
+
+### Wrong category  
+Check dashboard reasoning.  
+Adjust Smart Mode V2 rules if needed.
+
+### New category created unexpectedly  
+Add it to config.json if you want it predefined.
+
+---
+
+## 📜 License
+
+Internal personal project — no license required.
+
+---
+
+## ✨ Author
+
+**Joel Kruse**  
+Creator of Smart Sorter V5  
+Automation engineer & workflow architect 
