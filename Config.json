@@ -1,0 +1,101 @@
+{
+  "destinations": {
+    "career": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Career",
+    "resume": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Career/Resume",
+
+    "finance": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Finance",
+    "bank_statements": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Finance/Bank Statements",
+    "credit_card_statements": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Finance/Credit Card Statements",
+    "paystubs": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Finance/Paystubs",
+    "investments": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Finance/Investments",
+    "loans": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Finance/Loans",
+
+    "insurance": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Insurance",
+    "claims": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Insurance/Claims",
+
+    "legal": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Legal",
+    "medical": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Medical",
+
+    "taxes": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Taxes",
+
+    "utilities": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Utilities",
+
+    "receipts": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Receipts",
+    "statements": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Statements",
+
+    "personal": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Personal",
+    "subscriptions": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Personal/Subscriptions",
+    "warranties": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Personal/Warranties",
+
+    "photos": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Photos",
+    "videos": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Videos",
+
+    "other": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Other",
+    "review": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted/Review",
+
+    "sorted_root": "C:/Users/joelk/OneDrive/Smart Inbox/Incoming/Sorted"
+  },
+
+  "classification": {
+    "photo_extensions": [".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".heic"],
+    "video_extensions": [".mp4", ".mov", ".avi", ".mkv", ".lrv", ".insv"],
+    "document_extensions": [".pdf", ".docx", ".txt", ".xlsx"]
+  },
+
+  "temp_extensions": [".tmp", ".crdownload", ".partial", ".download"],
+
+  "file_readiness": {
+    "timeout_seconds": 12,
+    "stability_check_interval": 0.4
+  },
+
+  "logging": {
+    "enabled": true,
+    "log_to_file": true,
+    "log_file_path": "C:/SmartInbox/System/sorter.log"
+  },
+
+  "ai_classification": {
+    "model": "qwen2.5:0.5b",
+    "ollama_url": "http://localhost:11434/api/generate",
+    "use_google_vision": true,
+    "gemini": {
+      "enabled": true,
+      "model": "gemini-2.5-pro",
+      "api_key": "PASTE YOUR API KEY HERE",
+      "max_output_tokens": 8192,
+      "structured_tables": true,
+      "return_all_tables": true,
+      "debug_marker": "GEMINI_BLOCK_LOADED"
+    }
+  },
+
+  "observer_groups": {
+    "downloads": [
+      "C:/SmartInboxLocal/Incoming/Downloads"
+    ],
+    "scans": [
+      "C:/SmartInboxLocal/Incoming/Scans"
+    ],
+    "other_sources": [
+      "C:/SmartInboxLocal/Incoming/OtherSources"
+    ],
+    "phonelink": [
+      "C:/SmartInboxLocal/Incoming/PhoneLink"
+    ],
+    "meta_ai": [
+      "C:/Users/joelk/OneDrive/Pictures/Samsung Gallery/Download/Meta AI"
+    ],
+    "onedrive_camera": [
+      "C:/Users/joelk/OneDrive/Pictures/Samsung Gallery/DCIM/Camera"
+    ]
+  },
+
+  "initial_scan_groups": [
+    "downloads",
+    "scans",
+    "other_sources",
+    "phonelink",
+    "meta_ai"
+  ]
+}
