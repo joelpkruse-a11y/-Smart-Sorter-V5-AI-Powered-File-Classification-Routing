@@ -1,3 +1,19 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/Smart%20Sorter%20V5-AI%20Powered%20File%20Automation-4B9CD3?style=for-the-badge&logo=google&logoColor=white" alt="Smart Sorter V5 Banner">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Gemini%202.5%20Pro-Structured%20AI%20Classification-7A42F4?style=for-the-badge&logo=google&logoColor=white" alt="Gemini Badge">
+  <img src="https://img.shields.io/badge/Google%20Vision-OCR%20Enabled-34A853?style=for-the-badge&logo=google&logoColor=white" alt="Vision Badge">
+  <img src="https://img.shields.io/badge/Smart%20Mode%20V2-Deterministic%20Refinement-FBBC05?style=for-the-badge" alt="Smart Mode Badge">
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/OneDrive%20Safe-Watcher%20Optimized-0078D4?style=for-the-badge&logo=microsoft&logoColor=white" alt="OneDrive Badge">
+  <img src="https://img.shields.io/badge/Dynamic%20Routing-Auto%20Folder%20Creation-FF6F61?style=for-the-badge" alt="Dynamic Routing Badge">
+  <img src="https://img.shields.io/badge/Photos%20%2F%20Videos-Date%20Based%20Sorting-4285F4?style=for-the-badge" alt="Date Routing Badge">
+</p>
+
 # Smart Sorter V5  
 AI‑Powered Document, Photo, and Video Classification & Routing System  
 Author: Joel Kruse
