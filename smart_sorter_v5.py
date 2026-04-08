@@ -78,22 +78,56 @@ def move_with_retry(src: str, dst: str, retries: int = 8, delay: float = 0.8) ->
     return False
 
 # ---------------------------------------------------------
-# Config paths
+# CONFIG PATH AUTO-DETECT (Windows, Codespaces, Linux)
 # ---------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(os.path.expanduser("C:/SmartInbox/"), "config.json")
+def detect_config_path(log):
+    """
+    Determine the correct config.json path depending on environment:
+    - Windows desktop (your main environment)
+    - GitHub Codespaces
+    - Linux / WSL
+    - Fallback to local directory
+    """
 
-CONFIDENCE_ACCEPT = 0.90
-CONFIDENCE_REFINE = 0.70
+    # 1. Detect GitHub Codespaces
+    try:
+        if os.environ.get("CODESPACES") == "true" or "CODESPACE_NAME" in os.environ:
+            path = "/workspaces/SmartInbox/config.json"
+            log(f"[CONFIG] Running in Codespaces → {path}", "diag")
+            return path
+    except Exception:
+        pass
 
-LOG_TO_FILE = True
-LOG_FILE_PATH = os.path.join(BASE_DIR, "System", "sorter.log")
+    # 2. Detect Windows (your main machine)
+    if os.name == "nt":
+        path = "C:/SmartInbox/config.json"
+        log(f"[CONFIG] Running on Windows → {path}", "diag")
+        return path
 
-DESTINATIONS = {}
-CLASSIFICATION_CONFIG = {}
-TEMP_EXTENSIONS = []
-FILE_READINESS = {}
-FULL_CONFIG = {}
+    # 3. Detect Linux / WSL
+    try:
+        if "microsoft" in os.uname().release.lower():
+            # WSL
+            path = "/mnt/c/SmartInbox/config.json"
+            log(f"[CONFIG] Running in WSL → {path}", "diag")
+            return path
+    except Exception:
+        pass
+
+    # 4. Generic Linux fallback
+    path = "/home/codespace/SmartInbox/config.json"
+    if os.path.exists(path):
+        log(f"[CONFIG] Linux fallback found → {path}", "diag")
+        return path
+
+    # 5. Final fallback: local directory
+    fallback = os.path.join(os.getcwd(), "config.json")
+    log(f"[CONFIG] Fallback to local config.json → {fallback}", "warn")
+    return fallback
+
+
+# Use the auto-detect function
+CONFIG_PATH = detect_config_path(log)
 
 # ---------------------------------------------------------
 # Color map for console output
