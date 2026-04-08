@@ -1,8 +1,11 @@
+
+
 import threading
 import http.server
 import socketserver
 import json
 from datetime import datetime
+import os
 
 # Store last N events
 MAX_EVENTS = 200
@@ -19,7 +22,6 @@ def add_event(event: dict):
 
 # -------------------------------------------------------------------
 # HTML TEMPLATE (SAFE — NO .format() BRACES)
-# We will use .replace() ONLY for {count} and {events_html}
 # -------------------------------------------------------------------
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -95,15 +97,28 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 
 # -------------------------------------------------------------------
-# Start dashboard server
+# Start dashboard server (Codespaces-compatible)
 # -------------------------------------------------------------------
-def start_dashboard(port=8765):
+def start_dashboard(host="0.0.0.0", port=8765):
     """Run the dashboard in a background thread."""
     def run():
-        with socketserver.TCPServer(("0.0.0.0", port), Handler) as httpd:
-            print(f"[V3-DASH] Dashboard running at http://localhost:{port}")
+        with socketserver.TCPServer((host, port), Handler) as httpd:
+
+            # Detect Codespaces forwarded URL
+            forwarded = None
+            try:
+                codespace = os.environ.get("CODESPACE_NAME")
+                if codespace:
+                    forwarded = f"https://{codespace}-{port}.githubpreview.dev"
+            except Exception:
+                forwarded = None
+
+            if forwarded:
+                print(f"[V3-DASH] Dashboard running at {forwarded}")
+            else:
+                print(f"[V3-DASH] Dashboard running at http://{host}:{port}")
+
             httpd.serve_forever()
 
     t = threading.Thread(target=run, daemon=True)
     t.start()
-
