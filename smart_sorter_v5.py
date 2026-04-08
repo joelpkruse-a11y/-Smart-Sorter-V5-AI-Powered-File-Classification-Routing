@@ -78,7 +78,22 @@ def move_with_retry(src: str, dst: str, retries: int = 8, delay: float = 0.8) ->
     return False
 
 # ---------------------------------------------------------
-# CONFIG PATH AUTO-DETECT (Windows, Codespaces, Linux)
+# BASE PATHS + LOGGING GLOBALS (must be defined early)
+# ---------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Logging globals MUST be defined before log() is declared
+LOG_TO_FILE = True
+LOG_FILE_PATH = os.path.join(BASE_DIR, "System", "sorter.log")
+
+DESTINATIONS = {}
+CLASSIFICATION_CONFIG = {}
+TEMP_EXTENSIONS = []
+FILE_READINESS = {}
+FULL_CONFIG = {}
+
+# ---------------------------------------------------------
+# CONFIG PATH AUTO-DETECT (Windows, Codespaces, Linux, WSL)
 # ---------------------------------------------------------
 def detect_config_path():
     """
@@ -89,30 +104,30 @@ def detect_config_path():
     - Fallback to local directory
     """
 
-    # 1. Detect GitHub Codespaces
+    # 1. GitHub Codespaces
     try:
         if os.environ.get("CODESPACES") == "true" or "CODESPACE_NAME" in os.environ:
             return "/workspaces/SmartInbox/config.json"
     except Exception:
         pass
 
-    # 2. Detect Windows
+    # 2. Windows
     if os.name == "nt":
         return "C:/SmartInbox/config.json"
 
-    # 3. Detect WSL
+    # 3. WSL
     try:
         if "microsoft" in os.uname().release.lower():
             return "/mnt/c/SmartInbox/config.json"
     except Exception:
         pass
 
-    # 4. Linux fallback
+    # 4. Linux fallback (Codespaces container)
     linux_path = "/home/codespace/SmartInbox/config.json"
     if os.path.exists(linux_path):
         return linux_path
 
-    # 5. Final fallback
+    # 5. Final fallback: local directory
     return os.path.join(os.getcwd(), "config.json")
 
 
