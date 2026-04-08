@@ -378,7 +378,18 @@ def is_document_photo_by_text(path: str, config: dict, log) -> bool:
     except Exception as e:
         log(f"[DOC-PHOTO] OCR check failed: {e}", "warn")
         return False
-
+# ---------------------------------------------------------
+# DOCUMENT-PHOTO DETECTION (EDGE-BASED PLACEHOLDER)
+# ---------------------------------------------------------
+def is_document_photo_by_edges(path: str, log=None) -> bool:
+    """
+    Placeholder for edge-based document photo detection.
+    Currently always returns False.
+    This prevents undefined-name errors in GitHub Actions.
+    """
+    if log:
+        log("[DOC-PHOTO] Edge-based detection not implemented; returning False.", "diag")
+    return False
 # ---------------------------------------------------------
 # IMAGE → CLEAN PDF CONVERSION
 # ---------------------------------------------------------
