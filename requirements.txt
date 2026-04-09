@@ -8,7 +8,7 @@ google-api-core>=2.17.1
 google-auth>=2.29.0
 
 # --- OCR / Document Processing ---
-PyMuPDF==1.23.26
+PyMuPDF==1.24.0
 pillow==10.3.0
 opencv-python==4.9.0.80
 pdfminer.six==20231228
