@@ -1,0 +1,69 @@
+{
+  "version": "5.0",
+  "environment": "render",
+
+  "paths": {
+    "incoming": "/opt/render/project/src/uploads",
+    "processed": "/opt/render/project/src/processed",
+    "failed": "/opt/render/project/src/failed",
+    "temp": "/opt/render/project/src/temp"
+  },
+
+  "routing": {
+    "create_new_categories": true,
+    "default_category": "Uncategorized",
+    "other_category": "Other",
+    "preserve_unknown_categories": true
+  },
+
+  "ai": {
+    "provider": "gemini",
+    "model": "gemini-2.0-flash",
+    "temperature": 0.0,
+    "max_output_tokens": 2048,
+    "smart_mode_v2": {
+      "enabled": true,
+      "boost_exact_matches": true,
+      "boost_issuer_terms": true,
+      "boost_filename_signals": true,
+      "confidence_floor": 0.35,
+      "fallback_to_text_extraction": true
+    }
+  },
+
+  "filename_engine": {
+    "enabled": true,
+    "version": "3.0",
+    "include_category": true,
+    "include_date": true,
+    "include_issuer": true,
+    "max_length": 120,
+    "replace_spaces_with": "_",
+    "strip_special_characters": true
+  },
+
+  "text_extraction": {
+    "pdf": true,
+    "docx": true,
+    "txt": true,
+    "image_ocr": true,
+    "ocr_language": "eng"
+  },
+
+  "logging": {
+    "enabled": true,
+    "level": "INFO",
+    "log_to_file": true,
+    "file_path": "/opt/render/project/src/sorter.log",
+    "include_ai_responses": true,
+    "include_routing_decisions": true,
+    "include_filename_engine": true
+  },
+
+  "dashboard": {
+    "history_limit": 20,
+    "dark_mode_persistence": true,
+    "show_preview_icons": true,
+    "enable_realtime_updates": true
+  }
+}
