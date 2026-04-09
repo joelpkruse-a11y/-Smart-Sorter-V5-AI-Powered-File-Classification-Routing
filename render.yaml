@@ -1,13 +1,14 @@
 services:
   - type: web
     name: smart-sorter-v5
-    env: python
+    env: docker
     plan: starter
 
-    # Pin Python to a wheel-supported version
+    dockerfilePath: ./Dockerfile
+
+    autoDeploy: true
+
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.2
       - key: GEMINI_API_KEY
         sync: false
       - key: GEMINI_MODEL
