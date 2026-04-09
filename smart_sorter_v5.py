@@ -39,10 +39,10 @@ except Exception:
 print("[DEBUG] Loaded smart_sorter_v5 (Render Edition) from:", __file__)
 
 # ---------------------------------------------------------
-# Gemini 2.0 Flash scaffolding
+#gemini-2.5-pro scaffolding
 # ---------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
 def _init_gemini():
     if not GEMINI_API_KEY:
@@ -59,7 +59,7 @@ def gemini_process_document(
     tables_vision=None,
     metadata_vision=None,
 ) -> dict:
-    """Strict JSON Gemini 2.0 Flash classification."""
+    """Strict JSON gemini-2.5-pro classification."""
     _init_gemini()
 
     tables_vision = tables_vision or []
@@ -73,7 +73,7 @@ def gemini_process_document(
     category_names = [c.get("name", "other") for c in categories]
 
     prompt = f"""
-You are Smart Sorter V5 running on Gemini 2.0 Flash.
+You are Smart Sorter V5 running on gemini-2.5-pro.
 
 You must:
 1. Classify the document into ONE of these categories: {category_names}
