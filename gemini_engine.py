@@ -238,14 +238,15 @@ def _fallback_local_classifier(ocr_text: str, log) -> Optional[dict]:
 
 
 # ============================================================
-# SCHEMA NORMALIZER
+# SCHEMA NORMALIZER (fixed summary handling)
 # ============================================================
 def _normalize_schema(result: dict,
                       fallback_text: str,
                       tables_vision: Optional[list],
                       metadata_vision: Optional[dict]) -> dict:
     safe = {
-        "text": "",  # keep OCR text locally, not in Gemini JSON,
+        # ✅ keep usable text for Smart Sorter summary
+        "text": (result.get("text") or fallback_text or ""),
         "category": (result.get("category") or "other"),
         "confidence": float(result.get("confidence") or 0.0),
         "metadata": result.get("metadata") or {},
@@ -310,15 +311,6 @@ def gemini_process_document(
         "Content-Type": "application/json"
     }
 
-    # Build parts
-    def build_file_part() -> dict:
-        if path:
-            p = _normalize_windows_path(path)
-            mime = detect_mime_type(p)
-            encoded = encode_file_base64(p)  # may raise; caught above
-            return {"inline_data": {"mime_type": mime, "data": encoded}}
-        return {"text": (text or "")}
-
     def build_text_hint_part() -> Optional[dict]:
         """
         If extracted text is present, include it to prevent the model from
@@ -342,11 +334,11 @@ def gemini_process_document(
 
             parts = [{"text": prompt}]
 
-            # Include file part or text-only part
+            # Include extracted text (if any)
             if text and text.strip():
                 parts.append({"text": text[:12000]})
 
-            # Include extracted text hint when available (helps even in file mode)
+            # Include extracted text hint when available
             hint = build_text_hint_part()
             if hint:
                 parts.append(hint)
@@ -374,7 +366,7 @@ def gemini_process_document(
                 log("[AI] Gemini returned no text block.", "warn")
                 continue
 
-            # Save raw output
+            # Save raw output (best-effort)
             try:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 debug_path = f"C:/SmartInbox/debug_gemini_raw_{ts}.txt"
