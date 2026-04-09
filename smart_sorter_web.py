@@ -21,14 +21,18 @@ os.makedirs(PREVIEW_FOLDER, exist_ok=True)
 # In-memory upload records (demo only)
 uploads = []
 
+# ---------------------------
+# HTML TEMPLATE
+# ---------------------------
 HTML_TEMPLATE = '''
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Smart Sorter V5 – Upload</title>
+
 <style>
-/* --- styles omitted for brevity --- (include your full CSS block here) --- */
+/* --- styles omitted for brevity --- */
 
 body {
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -238,6 +242,7 @@ body.dark th {
 }
 </style>
 </head>
+
 <body>
 <div class="top-bar">
     <h1>Smart Sorter V5</h1>
@@ -269,10 +274,12 @@ body.dark th {
         <th>Preview</th>
         <th>Download</th>
     </tr>
+
     {% for u in uploads %}
     <tr>
         <td>{{ u.filename }}</td>
         <td>{{ u.upload_time }}</td>
+
         <td>
             {% if u.status == 'Completed' %}
                 <span class="status-badge completed">Completed</span>
@@ -282,24 +289,22 @@ body.dark th {
                 <span class="status-badge failed">{{ u.status }}</span>
             {% endif %}
         </td>
+
         <td><span class="category-tag">{{ u.category or 'Pending' }}</span></td>
-        <td>{{ '%.2f'|format(u.confidence) if u.confidence is not none else 'N/A' }}</td>
+        <td>{{ '%.2f'|format(u.confidence) if u.confidence else 'N/A' }}</td>
         <td class="summary-cell">{{ u.summary or 'Processing...' }}</td>
+
         <td>
-            {% if u.preview and (u.preview.lower().endswith('.jpg')
-                or u.preview.lower().endswith('.jpeg')
-                or u.preview.lower().endswith('.png')
-                or u.preview.lower().endswith('.webp')) %}
+            {% if u.preview %}
                 <img src="{{ url_for('preview_file', filename=u.preview) }}" class="preview-img">
             {% else %}
                 <span class="muted">No preview</span>
             {% endif %}
         </td>
+
         <td>
             {% if u.processed_filename and u.status == 'Completed' %}
-                <a href="{{ url_for('download_processed', filename=u.processed_filename) }}" class="download-btn">
-                    Download
-                </a>
+                <a href="{{ url_for('download_processed', filename=u.processed_filename) }}" class="download-btn">Download</a>
             {% else %}
                 <span class="muted">Not available</span>
             {% endif %}
@@ -310,8 +315,9 @@ body.dark th {
 
 <script>
 const body = document.body;
-const themeToggle = document.getElementById('themeToggle');
-themeToggle.addEventListener('click', () => body.classList.toggle('dark'));
+document.getElementById('themeToggle').addEventListener('click', () => {
+    body.classList.toggle('dark');
+});
 
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
@@ -349,23 +355,34 @@ setInterval(() => {
     if (!document.hidden) window.location.reload();
 }, 5000);
 </script>
+
 </body>
 </html>
 '''
+
+# ---------------------------
+# ROUTES
+# ---------------------------
 
 @app.route('/preview/<filename>')
 def preview_file(filename):
     return send_from_directory(PREVIEW_FOLDER, filename)
 
+# FIXED: recursive search so downloads work even in category subfolders
 @app.route('/download/<path:filename>')
 def download_processed(filename):
-    return send_from_directory(PROCESSED_FOLDER, filename, as_attachment=True)
+    for root, dirs, files in os.walk(PROCESSED_FOLDER):
+        if filename in files:
+            return send_from_directory(root, filename, as_attachment=True)
+    return "File not found", 404
 
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
     if request.method == 'POST':
+
         if 'file' not in request.files:
             return 'No file part', 400
+
         file = request.files['file']
         if file.filename == '':
             return 'No selected file', 400
@@ -394,19 +411,20 @@ def upload_file():
 
         def process_file(path, record, original_name):
             try:
-                # Call Smart Sorter V5
                 result = classify_and_route(path, config)
 
-                # Try to pull real values if classify_and_route returns them
                 record['status'] = 'Completed'
-                record['category'] = result.get('category') if isinstance(result, dict) else (record.get('category') or 'ExampleCategory')
-                record['confidence'] = result.get('confidence') if isinstance(result, dict) else (record.get('confidence') or 0.95)
-                record['summary'] = result.get('summary') if isinstance(result, dict) else (record.get('summary') or 'Document processed successfully.')
+                record['category'] = result.get('category')
+                record['confidence'] = result.get('confidence')
+                record['summary'] = result.get('summary')
 
-                # Processed filename: prefer engine output, fallback to original
-                processed_name = None
-                if isinstance(result, dict):
-                    processed_name = result.get('final_filename') or result.get('routed_filename') or result.get('output_filename')
+                # Try all possible filename keys
+                processed_name = (
+                    result.get('final_filename')
+                    or result.get('routed_filename')
+                    or result.get('output_filename')
+                )
+
                 record['processed_filename'] = processed_name or original_name
 
             except Exception as e:
@@ -423,7 +441,10 @@ def upload_file():
 
     return render_template_string(HTML_TEMPLATE, uploads=uploads)
 
-# --- Render-compatible entry point ---
+# ---------------------------
+# ENTRY POINT
+# ---------------------------
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
