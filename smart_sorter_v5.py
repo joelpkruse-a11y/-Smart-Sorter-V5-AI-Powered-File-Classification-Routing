@@ -215,8 +215,7 @@ def clear_progress_line():
 # Load config.json
 # ---------------------------------------------------------
 def load_config():
-    global DESTINATIONS, CLASSIFICATION_CONFIG, TEMP_EXTENSIONS, FILE_READINESS
-    global LOG_TO_FILE, LOG_FILE_PATH, FULL_CONFIG
+    global FULL_CONFIG, LOG_TO_FILE, LOG_FILE_PATH
 
     log(f"Loading config from: {CONFIG_PATH}", "diag")
 
@@ -226,39 +225,32 @@ def load_config():
 
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            raw = f.read()
-            cfg = json.loads(raw)
+            cfg = json.load(f)
 
+        # Deep copy
         import copy
         FULL_CONFIG = copy.deepcopy(cfg)
 
-        FULL_CONFIG["ai_classification"] = cfg.get("ai_classification", {})
-        FULL_CONFIG["gemini"] = FULL_CONFIG["ai_classification"].get("gemini", {})
+        # --- FIXED: Load AI block correctly ---
+        ai_cfg = FULL_CONFIG.get("ai", {}) or {}
 
-        gem_cfg = FULL_CONFIG.get("gemini", {}) or {}
-        safe_gem_cfg = dict(gem_cfg)
-        if "api_key" in safe_gem_cfg:
-            safe_gem_cfg["api_key"] = "***REDACTED***"
-        log(f"[AI] Gemini config loaded: {safe_gem_cfg}", "diag")
+        # Redact API key for logs
+        safe_ai_cfg = dict(ai_cfg)
+        if "api_key" in safe_ai_cfg:
+            safe_ai_cfg["api_key"] = "***REDACTED***"
 
-        DESTINATIONS = FULL_CONFIG.get("destinations", {})
-        CLASSIFICATION_CONFIG = FULL_CONFIG.get("classification", {})
-        TEMP_EXTENSIONS = FULL_CONFIG.get("temp_extensions", [])
+        log(f"[AI] Gemini config loaded: {safe_ai_cfg}", "diag")
 
-        FILE_READINESS = FULL_CONFIG.get(
-            "file_readiness",
-            {"timeout_seconds": 10, "stability_check_interval": 0.5},
-        )
-
-        logging_cfg = FULL_CONFIG.get("logging", {})
-        LOG_TO_FILE = logging_cfg.get("enabled", True) and logging_cfg.get("log_to_file", True)
-        LOG_FILE_PATH = logging_cfg.get("log_file_path", LOG_FILE_PATH)
+        # --- Optional: load other blocks if needed ---
+        LOG_TO_FILE = FULL_CONFIG.get("logging", {}).get("log_to_file", False)
+        LOG_FILE_PATH = FULL_CONFIG.get("logging", {}).get("file_path", "sorter.log")
 
         return FULL_CONFIG
 
     except Exception as e:
         log(f"CONFIG LOAD ERROR: {e}", "error")
         return {}
+
 
 # ---------------------------------------------------------
 # Folder utilities
