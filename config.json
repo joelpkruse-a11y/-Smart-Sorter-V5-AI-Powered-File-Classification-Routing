@@ -16,20 +16,21 @@
     "preserve_unknown_categories": true
   },
 
-  "ai": {
+"ai": {
     "provider": "gemini",
     "model": "gemini-2.0-flash",
+    "api_key": "AIzaSyC62FG1ZypNQEvFRSPOkC2tWbLNVKjqWBk",
     "temperature": 0.0,
     "max_output_tokens": 2048,
     "smart_mode_v2": {
-      "enabled": true,
-      "boost_exact_matches": true,
-      "boost_issuer_terms": true,
-      "boost_filename_signals": true,
-      "confidence_floor": 0.35,
-      "fallback_to_text_extraction": true
+        "enabled": true,
+        "boost_exact_matches": true,
+        "boost_issuer_terms": true,
+        "boost_filename_signals": true,
+        "confidence_floor": 0.35,
+        "fallback_to_text_extraction": true
     }
-  },
+},
 
   "filename_engine": {
     "enabled": true,
