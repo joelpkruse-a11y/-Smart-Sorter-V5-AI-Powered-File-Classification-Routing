@@ -30,8 +30,7 @@
         "confidence_floor": 0.35,
         "fallback_to_text_extraction": true
     }
-}
-
+  },
   "filename_engine": {
     "enabled": true,
     "version": "3.0",
@@ -41,7 +40,7 @@
     "max_length": 120,
     "replace_spaces_with": "_",
     "strip_special_characters": true
-  },
+  }
 
   "text_extraction": {
     "pdf": true,
