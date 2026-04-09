@@ -3,9 +3,17 @@ services:
     name: smart-sorter-v5
     env: python
     plan: starter
+
+    # Pin Python to a wheel-supported version
+    pythonVersion: 3.12.0
+
+    # Build & start commands
     buildCommand: pip install -r requirements.txt
     startCommand: python smart_sorter_web.py
+
     autoDeploy: true
+
+    # Environment variables
     envVars:
       - key: GEMINI_API_KEY
         sync: false
