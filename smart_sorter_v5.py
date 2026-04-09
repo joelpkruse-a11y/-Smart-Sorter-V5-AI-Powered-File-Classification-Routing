@@ -4,24 +4,21 @@ import time
 import json
 import shutil
 import traceback
-import multiprocessing as mp
 from datetime import datetime
 import re
 
 import fitz
 import docx
+import google.generativeai as genai
 
 from ai_classifier import (
     classify_document_smart,
     generate_filename,
-    AI_MODEL_FAST,
-    AI_MODEL_SLOW,
 )
 
-from gemini_engine import gemini_process_document
 from smart_mode_v2 import smart_mode_v2
 from filename_router import generate_final_filename, route_file
-from v3_debug_dashboard import start_dashboard
+from v3_debug_dashboard import add_event
 
 from PIL import Image
 import numpy as np
@@ -32,110 +29,94 @@ try:
 except Exception:
     HAS_CV2 = False
 
-print("[DEBUG] Loaded smart_sorter_v5 from:", __file__)
+print("[DEBUG] Loaded smart_sorter_v5 (Render Edition) from:", __file__)
 
 # ---------------------------------------------------------
-# Utility: Ensure unique filename (avoid overwriting)
+# Gemini 2.0 Flash scaffolding
 # ---------------------------------------------------------
-def ensure_unique_filename(path: str) -> str:
-    base, ext = os.path.splitext(path)
-    counter = 1
-    new_path = path
-    while os.path.exists(new_path):
-        new_path = f"{base} ({counter}){ext}"
-        counter += 1
-    return new_path
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-# ---------------------------------------------------------
-# Utility: Move with retry (OneDrive-safe)
-# ---------------------------------------------------------
-def move_with_retry(src: str, dst: str, retries: int = 8, delay: float = 0.8) -> bool:
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            shutil.move(src, dst)
-            return True
-        except PermissionError as e:
-            last_err = e
-            log(f"[MOVE] Locked (PermissionError) retry {attempt}/{retries}: {src}", "warn")
-            time.sleep(delay)
-        except OSError as e:
-            last_err = e
-            winerr = getattr(e, "winerror", None)
-            if winerr == 32:
-                log(f"[MOVE] Locked (WinError 32) retry {attempt}/{retries}: {src}", "warn")
-                time.sleep(delay)
-                continue
-            log(f"[MOVE] OSError moving file: {e}", "error")
-            return False
-        except Exception as e:
-            last_err = e
-            log(f"[MOVE] Unexpected error moving file: {e}", "error")
-            return False
+def _init_gemini():
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    genai.configure(api_key=GEMINI_API_KEY)
 
-    if last_err:
-        log(f"[MOVE] Giving up after retries. Last error: {last_err}", "error")
-    return False
+def gemini_process_document(
+    *,
+    path: str,
+    text: str,
+    filename: str,
+    config: dict,
+    log,
+    tables_vision=None,
+    metadata_vision=None,
+) -> dict:
+    """Strict JSON Gemini 2.0 Flash classification."""
+    _init_gemini()
 
-# ---------------------------------------------------------
-# BASE PATHS + LOGGING GLOBALS (must be defined early)
-# ---------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    tables_vision = tables_vision or []
+    metadata_vision = metadata_vision or {}
 
-# Logging globals MUST be defined before log() is declared
-LOG_TO_FILE = True
-LOG_FILE_PATH = os.path.join(BASE_DIR, "System", "sorter.log")
+    ai_cfg = (config.get("ai") or {})
+    filename_style = ai_cfg.get("filename_style", "semantic-kebab")
 
-DESTINATIONS = {}
-CLASSIFICATION_CONFIG = {}
-TEMP_EXTENSIONS = []
-FILE_READINESS = {}
-FULL_CONFIG = {}
+    classification_cfg = (config.get("classification") or {})
+    categories = classification_cfg.get("categories", [])
+    category_names = [c.get("name", "other") for c in categories]
 
-# ---------------------------------------------------------
-# CONFIG PATH AUTO-DETECT (Windows, Codespaces, Linux, WSL)
-# ---------------------------------------------------------
-def detect_config_path():
-    """
-    Determine the correct config.json path depending on environment:
-    - Windows desktop
-    - GitHub Codespaces
-    - Linux / WSL
-    - Fallback to local directory
-    """
+    prompt = f"""
+You are Smart Sorter V5 running on Gemini 2.0 Flash.
 
-    # 1. GitHub Codespaces
+You must:
+1. Classify the document into ONE of these categories: {category_names}
+2. Provide a confidence score between 0 and 1.
+3. Provide a short reasoning string.
+4. Suggest a semantic filename using style "{filename_style}".
+5. Return STRICT JSON only.
+
+Input filename: {filename}
+
+Vision metadata:
+{json.dumps(metadata_vision, ensure_ascii=False, indent=2)}
+
+Document text:
+\"\"\"{(text or '')[:4000]}\"\"\"
+
+JSON response shape:
+{{
+  "text": "string",
+  "category": "string",
+  "confidence": 0.0,
+  "metadata": {{}},
+  "tables": [],
+  "filename": "string",
+  "reasoning": "string"
+}}
+"""
+
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    resp = model.generate_content(prompt)
+
     try:
-        if os.environ.get("CODESPACES") == "true" or "CODESPACE_NAME" in os.environ:
-            return "/workspaces/SmartInbox/config.json"
-    except Exception:
-        pass
+        data = json.loads(resp.text)
+    except Exception as e:
+        log(f"[AI] Gemini JSON parse failed: {e}", "error")
+        return {}
 
-    # 2. Windows
-    if os.name == "nt":
-        return "C:/SmartInbox/config.json"
+    # Defaults
+    data.setdefault("text", text or "")
+    data.setdefault("category", "other")
+    data.setdefault("confidence", 0.0)
+    data.setdefault("metadata", {})
+    data.setdefault("tables", [])
+    data.setdefault("filename", filename)
+    data.setdefault("reasoning", "")
 
-    # 3. WSL
-    try:
-        if "microsoft" in os.uname().release.lower():
-            return "/mnt/c/SmartInbox/config.json"
-    except Exception:
-        pass
-
-    # 4. Linux fallback (Codespaces container)
-    linux_path = "/home/codespace/SmartInbox/config.json"
-    if os.path.exists(linux_path):
-        return linux_path
-
-    # 5. Final fallback: local directory
-    return os.path.join(os.getcwd(), "config.json")
-
-
-# Use the auto-detect function
-CONFIG_PATH = detect_config_path()
+    return data
 
 # ---------------------------------------------------------
-# Color map for console output
+# Logging
 # ---------------------------------------------------------
 COLOR_MAP = {
     "success": "\033[92m",
@@ -143,182 +124,26 @@ COLOR_MAP = {
     "warn": "\033[93m",
     "diag": "\033[96m",
     "info": "\033[97m",
-
-    "category_finance": "\033[92m",
-    "category_insurance": "\033[94m",
-    "category_medical": "\033[95m",
-    "category_legal": "\033[97m",
-    "category_taxes": "\033[38;5;208m",
-    "category_receipts": "\033[93m",
-    "category_statements": "\033[96m",
-    "category_personal": "\033[36m",
-    "category_photos": "\033[92m",
-    "category_videos": "\033[95m",
-    "category_other": "\033[90m",
-    "category_review": "\033[91m",
-
     "reset": "\033[0m",
 }
-
-def category_color(category: str) -> str:
-    key = f"category_{(category or 'other').lower()}"
-    return COLOR_MAP.get(key, COLOR_MAP["category_other"])
-
-# ---------------------------------------------------------
-# Logging
-# ---------------------------------------------------------
-def ensure_log_dir():
-    try:
-        d = os.path.dirname(LOG_FILE_PATH)
-        if d and not os.path.exists(d):
-            os.makedirs(d, exist_ok=True)
-    except Exception:
-        pass
 
 def log(msg: str, level: str = "info"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     color = COLOR_MAP.get(level, COLOR_MAP["info"])
     reset = COLOR_MAP["reset"]
-    line = f"{color}[{level.upper()}] {ts} {msg}{reset}"
-    print(line)
-
-    if LOG_TO_FILE:
-        try:
-            ensure_log_dir()
-            plain = line.replace(color, "").replace(reset, "")
-            with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
-                f.write(plain + "\n")
-        except Exception:
-            pass
+    print(f"{color}[{level.upper()}] {ts} {msg}{reset}")
 
 # ---------------------------------------------------------
-# Progress bar (PDF OCR)
-# ---------------------------------------------------------
-def print_progress(prefix: str, current: int, total: int, start_time: float):
-    if total <= 0:
-        total = 1
-    ratio = current / total
-    bar_len = 20
-    filled = int(bar_len * ratio)
-    bar = "#" * filled + "-" * (bar_len - filled)
-    elapsed = time.time() - start_time
-    percent = int(ratio * 100)
-    msg = f"\r{prefix}: [{bar}] {percent:3d}% ({current}/{total}, {elapsed:.1f}s)"
-    sys.stdout.write(msg)
-    sys.stdout.flush()
-
-def clear_progress_line():
-    sys.stdout.write("\r" + " " * 80 + "\r")
-    sys.stdout.flush()
-
-# ---------------------------------------------------------
-# Load config.json
-# ---------------------------------------------------------
-def load_config():
-    global FULL_CONFIG, LOG_TO_FILE, LOG_FILE_PATH
-
-    log(f"Loading config from: {CONFIG_PATH}", "diag")
-
-    if not os.path.exists(CONFIG_PATH):
-        log(f"CONFIG ERROR: config.json not found at {CONFIG_PATH}", "error")
-        return {}
-
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-
-        # Deep copy
-        import copy
-        FULL_CONFIG = copy.deepcopy(cfg)
-
-        # --- FIXED: Load AI block correctly ---
-        ai_cfg = FULL_CONFIG.get("ai", {}) or {}
-
-        # Redact API key for logs
-        safe_ai_cfg = dict(ai_cfg)
-        if "api_key" in safe_ai_cfg:
-            safe_ai_cfg["api_key"] = "***REDACTED***"
-
-        log(f"[AI] Gemini config loaded: {safe_ai_cfg}", "diag")
-
-        # --- Optional: load other blocks if needed ---
-        LOG_TO_FILE = FULL_CONFIG.get("logging", {}).get("log_to_file", False)
-        LOG_FILE_PATH = FULL_CONFIG.get("logging", {}).get("file_path", "sorter.log")
-
-        return FULL_CONFIG
-
-    except Exception as e:
-        log(f"CONFIG LOAD ERROR: {e}", "error")
-        return {}
-
-
-# ---------------------------------------------------------
-# Folder utilities
-# ---------------------------------------------------------
-def ensure_folder(path: str):
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception as e:
-        log(f"Failed to create folder {path}: {e}", "error")
-
-def validate_and_repair_folders(cfg: dict):
-    for _, path in DESTINATIONS.items():
-        if path and not os.path.exists(path):
-            ensure_folder(path)
-
-    groups = cfg.get("observer_groups", {})
-    for _, paths in groups.items():
-        for p in paths:
-            if not os.path.exists(p):
-                ensure_folder(p)
-
-# ---------------------------------------------------------
-# Temp file detection
-# ---------------------------------------------------------
-def is_temp_file(path: str) -> bool:
-    ext = os.path.splitext(path)[1].lower()
-    return ext in TEMP_EXTENSIONS
-
-# ---------------------------------------------------------
-# Wait for file readiness (OneDrive-safe)
-# ---------------------------------------------------------
-def wait_for_file_ready(path: str) -> bool:
-    timeout = FILE_READINESS.get("timeout_seconds", 10)
-    interval = FILE_READINESS.get("stability_check_interval", 0.5)
-
-    if not os.path.exists(path):
-        return False
-
-    start = time.time()
-    last_size = -1
-
-    while time.time() - start < timeout:
-        try:
-            size = os.path.getsize(path)
-            if size == last_size and size > 0:
-                return True
-            last_size = size
-        except Exception:
-            pass
-        time.sleep(interval)
-
-    return False
-
-# ---------------------------------------------------------
-# TEXT CLEANING
+# TEXT EXTRACTION
 # ---------------------------------------------------------
 def clean_extracted_text(text: str) -> str:
     lines = text.splitlines()
     cleaned = [line.strip() for line in lines if line.strip()]
     return "\n".join(cleaned)
 
-# ---------------------------------------------------------
-# GENERIC TEXT EXTRACTION (PDF, DOCX, XLSX, TXT)
-# ---------------------------------------------------------
 def extract_text_generic(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
 
-    # Plain text formats
     if ext in [".txt", ".md", ".log", ".csv"]:
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -326,175 +151,105 @@ def extract_text_generic(path: str) -> str:
         except Exception:
             return ""
 
-    # DOCX
     if ext == ".docx":
         try:
             doc = docx.Document(path)
-            parts = []
-            for para in doc.paragraphs:
-                t = para.text.strip()
-                if t:
-                    parts.append(t)
+            parts = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
             return clean_extracted_text("\n".join(parts))
         except Exception:
             return ""
 
-    # PDF
     if ext == ".pdf":
         try:
             doc = fitz.open(path)
-            texts = []
-            total_pages = len(doc)
-            start_time = time.time()
-            for i, page in enumerate(doc, start=1):
-                t = page.get_text("text")
-                texts.append(t)
-                print_progress("OCR Extracting", i, total_pages, start_time)
+            texts = [page.get_text("text") for page in doc]
             doc.close()
-            clear_progress_line()
             return clean_extracted_text("\n".join(texts))
         except Exception:
-            clear_progress_line()
             return ""
 
-    # XLSX
     if ext == ".xlsx":
         try:
             import openpyxl
             wb = openpyxl.load_workbook(path, data_only=True)
             parts = []
-
             for sheet in wb.sheetnames:
                 ws = wb[sheet]
                 parts.append(f"### SHEET: {sheet} ###")
-
                 for row in ws.iter_rows(values_only=True):
-                    row_vals = [str(v).strip() for v in row if v is not None]
-                    if row_vals:
-                        parts.append(" | ".join(row_vals))
-
-            text = clean_extracted_text("\n".join(parts))
-            log(f"[XLSX] Extracted {len(text.splitlines())} lines from workbook", "diag")
-            return text
-        except Exception as e:
-            log(f"[XLSX] Extraction failed: {e}", "warn")
+                    vals = [str(v).strip() for v in row if v is not None]
+                    if vals:
+                        parts.append(" | ".join(vals))
+            return clean_extracted_text("\n".join(parts))
+        except Exception:
             return ""
 
     return ""
 
 # ---------------------------------------------------------
-# DOCUMENT-PHOTO DETECTION (OCR HEURISTICS)
-# ---------------------------------------------------------
-def is_document_photo_by_text(path: str, config: dict, log) -> bool:
-    try:
-        use_google_vision = config.get("ai_classification", {}).get("use_google_vision", False)
-        if not use_google_vision:
-            return False
-
-        from vision_ocr import extract_text_google_vision
-
-        ocr = extract_text_google_vision(path, log)
-        text = (ocr.get("text") or "").strip()
-
-        # Heuristic: lots of text → document
-        if len(text) >= 120:
-            return True
-
-        # Heuristic: many words → document
-        words = re.findall(r"[A-Za-z0-9]{2,}", text)
-        if len(words) >= 25:
-            return True
-
-        return False
-    except Exception as e:
-        log(f"[DOC-PHOTO] OCR check failed: {e}", "warn")
-        return False
-# ---------------------------------------------------------
-# DOCUMENT-PHOTO DETECTION (EDGE-BASED PLACEHOLDER)
-# ---------------------------------------------------------
-def is_document_photo_by_edges(path: str, log=None) -> bool:
-    """
-    Placeholder for edge-based document photo detection.
-    Currently always returns False.
-    This prevents undefined-name errors in GitHub Actions.
-    """
-    if log:
-        log("[DOC-PHOTO] Edge-based detection not implemented; returning False.", "diag")
-    return False
-# ---------------------------------------------------------
-# IMAGE → CLEAN PDF CONVERSION
+# IMAGE → CLEAN PDF
 # ---------------------------------------------------------
 def convert_image_to_clean_pdf(image_path: str, log) -> str:
     base, _ = os.path.splitext(image_path)
     pdf_path = base + "_cleaned.pdf"
 
     try:
-        img = Image.open(image_path)
-        img = img.convert("RGB")
-
+        img = Image.open(image_path).convert("RGB")
         img_np = np.array(img)
 
         if img_np.ndim == 3 and HAS_CV2:
-            gray_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
             bw = cv2.adaptiveThreshold(
-                gray_np,
-                255,
+                gray, 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY,
-                35,
-                10,
+                35, 10
             )
-            bw_img = Image.fromarray(bw)
-        elif img_np.ndim == 3 and not HAS_CV2:
-            log("[PDF] OpenCV not available, using grayscale fallback.", "warn")
-            bw_img = img.convert("L")
+            Image.fromarray(bw).save(pdf_path, "PDF", resolution=300)
         else:
-            bw_img = Image.fromarray(img_np)
+            img.convert("L").save(pdf_path, "PDF", resolution=300)
 
-        bw_img.save(pdf_path, "PDF", resolution=300)
-        log(f"[PDF] Image converted to cleaned PDF (storage): {pdf_path}", "diag")
+        log(f"[PDF] Converted to cleaned PDF: {pdf_path}", "diag")
         return pdf_path
 
     except Exception as e:
-        log(f"[PDF] Image→PDF conversion failed: {e}", "warn")
+        log(f"[PDF] Conversion failed: {e}", "warn")
         return image_path
 
 # ---------------------------------------------------------
-# MAIN CLASSIFICATION PIPELINE
+# RENDER-SAFE CLASSIFICATION ENTRYPOINT
 # ---------------------------------------------------------
-def classify_and_route(path: str, config: dict):
-    path = os.path.normpath(path)
+def process_file_for_web(path: str, config: dict) -> dict:
+    """
+    This is the ONLY entrypoint your Flask dashboard should call.
+    It returns a dict with:
+      - category
+      - confidence
+      - summary
+      - final_filename
+    """
+    try:
+        result = _classify_and_route_internal(path, config)
+        return result or {"status": "Failed"}
+    except Exception as e:
+        log(f"[WEB] Error: {e}", "error")
+        return {"status": "Failed", "summary": str(e)}
 
+# ---------------------------------------------------------
+# INTERNAL PIPELINE (same as V5, minus watchers)
+# ---------------------------------------------------------
+def _classify_and_route_internal(path: str, config: dict):
     if not os.path.exists(path):
-        return
-
-    # Skip temp files
-    if is_temp_file(path):
-        log(f"Skipping temp file: {path}", "diag")
-        return
+        return {"status": "Failed", "summary": "File missing"}
 
     original_name = os.path.basename(path)
-
-    # Skip cleaned PDFs generated by sorter
-    if original_name.lower().endswith("_cleaned.pdf"):
-        log(f"[SKIP] Ignoring cleaned PDF: {path}", "diag")
-        return
-
-    # Wait for OneDrive to finish writing
-    if not wait_for_file_ready(path):
-        log(f"File not ready (timeout): {path}", "warn")
-        return
-
     ext = os.path.splitext(original_name)[1].lower()
 
-    classification_cfg = (config or {}).get("classification", {}) or {}
+    classification_cfg = (config.get("classification") or {})
     photo_exts = [e.lower() for e in classification_cfg.get("photo_extensions", [])]
     video_exts = [e.lower() for e in classification_cfg.get("video_extensions", [])]
 
-    use_google_vision = (config or {}).get("ai_classification", {}).get("use_google_vision", False)
-
-    # Filesystem metadata
-    metadata_fs = {}
+    # Metadata
     try:
         stat = os.stat(path)
         metadata_fs = {
@@ -502,430 +257,127 @@ def classify_and_route(path: str, config: dict):
             "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
         }
     except Exception:
-        pass
+        metadata_fs = {}
 
-    # Default values
-    force_review = False
+    # Defaults
+    category = "other"
+    confidence = 0.0
     ai_filename = None
-    tables = []
-    ocr_confidence = None
     text = ""
     extracted_text = ""
     metadata = dict(metadata_fs)
-    category = "other"
-    confidence = 0.0
     reasoning = ""
     treat_as_document = False
 
     classification_path = path
     storage_path = path
 
-    # XLSX always treated as document
+    # XLSX always document
     if ext == ".xlsx":
         treat_as_document = True
 
-    # ---------------------------------------------------------
     # PHOTO DETECTION
-    # ---------------------------------------------------------
     if ext in photo_exts:
-        try:
-            treat_as_document = bool(is_document_photo_by_text(path, config, log))
-        except Exception as e:
-            log(f"[DOC-PHOTO] OCR heuristic failed: {e}", "warn")
-
-        # Optional edge-based detection
-        try:
-            if "is_document_photo_by_edges" in globals():
-                treat_as_document = treat_as_document or bool(
-                    is_document_photo_by_edges(path, log=log)
-                )
-        except Exception as e:
-            log(f"[DOC-PHOTO] Edge heuristic failed: {e}", "warn")
-
-        # If NOT a document → it's a photo
+        treat_as_document = False  # simplified for Render
         if not treat_as_document:
             category = "photos"
             confidence = 1.0
             ai_filename = original_name
-            text = ""
-            metadata = dict(metadata_fs)
 
-    # ---------------------------------------------------------
     # VIDEO DETECTION
-    # ---------------------------------------------------------
     elif ext in video_exts:
         category = "videos"
         confidence = 1.0
         ai_filename = original_name
-        text = ""
-        metadata = dict(metadata_fs)
 
-    # ---------------------------------------------------------
-    # DOCUMENT-PHOTO → convert to PDF
-    # ---------------------------------------------------------
+    # DOCUMENT-PHOTO → PDF
     if ext in photo_exts and treat_as_document:
-        log("[PDF] Converting document photo to cleaned B/W PDF (storage)...", "diag")
-        pdf_path = convert_image_to_clean_pdf(path, log)
-        storage_path = pdf_path
+        storage_path = convert_image_to_clean_pdf(path, log)
         classification_path = path
 
-    # Non-photo documents
+    # NON-PHOTO DOCUMENT
     if ext not in photo_exts:
-        storage_path = path
-        classification_path = path
+        extracted_text = extract_text_generic(classification_path)
 
-    # ---------------------------------------------------------
-    # DOCUMENT CLASSIFICATION (Gemini + fallback)
-    # ---------------------------------------------------------
-    if (category not in ("photos", "videos")) or treat_as_document:
-        log(f"[DOC-PHOTO] treat_as_document={treat_as_document} ext={ext}", "diag")
+    # GEMINI CLASSIFICATION
+    gemini_result = gemini_process_document(
+        path=classification_path,
+        text=extracted_text,
+        filename=original_name,
+        config=config,
+        log=log,
+    )
 
-        # Extract text for non-photo documents
-        if os.path.splitext(classification_path)[1].lower() not in photo_exts:
-            extracted_text = extract_text_generic(classification_path)
+    if gemini_result:
+        text = gemini_result.get("text", "") or extracted_text
+        category = gemini_result.get("category", "other")
+        confidence = float(gemini_result.get("confidence", 0.0))
+        metadata_ai = gemini_result.get("metadata") or {}
+        ai_filename = gemini_result.get("filename") or original_name
+        reasoning = gemini_result.get("reasoning", "")
 
-        metadata_vision = {}
-        tables_vision = []
+        from metadata_enhancer import enhance_metadata
+        metadata = enhance_metadata(
+            text=text,
+            metadata_ai=metadata_ai,
+            metadata_vision={},
+            metadata_fs=metadata_fs
+        )
 
-        is_image = os.path.splitext(classification_path)[1].lower() in photo_exts
+    # FALLBACK FILENAME
+    if not ai_filename:
+        ai_filename = generate_filename(
+            text=text,
+            category=category,
+            original_filename=original_name,
+            metadata=metadata,
+        )
 
-        # Optional Google Vision OCR
-        if is_image and treat_as_document and use_google_vision:
-            try:
-                from vision_ocr import extract_text_google_vision
-                ocr_img = extract_text_google_vision(classification_path, log)
-
-                extracted_text = (ocr_img.get("text") or "").strip() or extracted_text
-                metadata_vision = ocr_img.get("metadata") or {}
-                tables_vision = ocr_img.get("tables") or {}
-
-                log(f"[DOC-PHOTO] OCR prepass: {len(extracted_text)} chars", "diag")
-            except Exception as e:
-                log(f"[DOC-PHOTO] OCR prepass failed: {e}", "warn")
-
-        # ---------------------------------------------------------
-        # GEMINI STRICT MODE
-        # ---------------------------------------------------------
-        gemini_result = None
-        try:
-            gemini_result = gemini_process_document(
-                path=classification_path,
-                text=extracted_text,
-                filename=original_name,
-                config=config,
-                log=log,
-                tables_vision=tables_vision,
-                metadata_vision=metadata_vision,
-            )
-        except Exception as e:
-            log(f"[AI] Gemini call crashed: {e}", "error")
-
-        # ---------------------------------------------------------
-        # GEMINI SUCCESS
-        # ---------------------------------------------------------
-        if gemini_result:
-            text = gemini_result.get("text", "") or extracted_text or ""
-            category = gemini_result.get("category", "other") or "other"
-            confidence = float(gemini_result.get("confidence", 0.0) or 0.0)
-            metadata_ai = gemini_result.get("metadata") or {}
-            tables = gemini_result.get("tables") or []
-            ai_filename = gemini_result.get("filename") or None
-            reasoning = gemini_result.get("reasoning", "") or ""
-
-            from metadata_enhancer import enhance_metadata
-            metadata = enhance_metadata(
-                text=text,
-                metadata_ai=metadata_ai,
-                metadata_vision=metadata_vision,
-                metadata_fs=metadata_fs
-            )
-
-            c_color = category_color(category)
-            reset = COLOR_MAP["reset"]
-            print(f"{c_color}[CATEGORY] Gemini classified as {category.capitalize()} ({confidence:.2f}){reset}")
-            log(f"[AI] Gemini category: {category} ({confidence:.2f})", "diag")
-            if ai_filename:
-                log(f"[AI] Gemini filename: {ai_filename}", "diag")
-            if reasoning:
-                log(f"[AI] Reasoning: {reasoning}", "diag")
-
-        # ---------------------------------------------------------
-        # GEMINI FAILED → FALLBACK CLASSIFIER
-        # ---------------------------------------------------------
-        else:
-            ocr = {}
-            if use_google_vision:
-                try:
-                    if classification_path.lower().endswith(".pdf"):
-                        from vision_pdf_ocr import extract_text_google_vision_pdf
-                        ocr = extract_text_google_vision_pdf(classification_path, log)
-                    else:
-                        from vision_ocr import extract_text_google_vision
-                        ocr = extract_text_google_vision(classification_path, log)
-                except Exception:
-                    ocr["text"] = extracted_text
-            else:
-                ocr["text"] = extracted_text
-
-            text = ocr.get("text", "") or ""
-            ocr_confidence = ocr.get("ocr_confidence")
-            metadata_vision = ocr.get("metadata") or {}
-            tables = ocr.get("tables") or []
-
-            result = classify_document_smart(
-                text,
-                original_name,
-                ocr_confidence=ocr_confidence,
-                metadata=metadata_vision,
-                tables=tables,
-            )
-
-            category = result.get("category", "other")
-            confidence = float(result.get("confidence", 0.0) or 0.0)
-            force_review = result.get("force_review", False)
-            metadata_ai = result.get("metadata", {}) or {}
-
-            from metadata_enhancer import enhance_metadata
-            metadata = enhance_metadata(
-                text=text,
-                metadata_ai=metadata_ai,
-                metadata_vision=metadata_vision,
-                metadata_fs=metadata_fs
-            )
-
-    # ---------------------------------------------------------
-    # FALLBACK FILENAME GENERATION
-    # ---------------------------------------------------------
-    if not ai_filename or str(ai_filename).strip().lower() in (
-        "document", "document.pdf", "other_document", "other_document.pdf"
-    ):
-        try:
-            ai_filename = generate_filename(
-                text=text or extracted_text or "",
-                category=category or "other",
-                original_filename=original_name,
-                metadata=metadata,
-            )
-            log(f"[NAME] Generated fallback filename: {ai_filename}", "diag")
-        except Exception as e:
-            log(f"[NAME] Fallback filename generation failed: {e}", "warn")
-            ai_filename = ai_filename or original_name
-
-    # ---------------------------------------------------------
-    # SMART MODE V2
-    # ---------------------------------------------------------
+    # SMART MODE
     result_for_smart = {
         "category": category,
         "confidence": confidence,
         "metadata": metadata,
         "text": text,
     }
+    final_category = smart_mode_v2(result_for_smart, log) or category
 
-    final_category = smart_mode_v2(result_for_smart, log)
-    if not final_category:
-        final_category = category or "other"
-
-    if force_review:
-        final_category = "review"
-
-    log(f"[SMART] Final category: {final_category} ({confidence:.2f})", "diag")
-
-    # Canonical category normalization
-    canonical_map = {
-        "medical bill": "medical",
-        "medical bills": "medical",
-        "medical statement": "medical",
-    }
-    key = (final_category or "").strip().lower()
-    if key in canonical_map:
-        log(f"[SMART] Normalizing category '{final_category}' → '{canonical_map[key]}'", "diag")
-        final_category = canonical_map[key]
-
-    # ---------------------------------------------------------
-    # PREPARE ROUTER INPUT
-    # ---------------------------------------------------------
-    text = text or ""
-    extracted_text = extracted_text or ""
-    reasoning = reasoning or ""
-    ai_filename = ai_filename or original_name
-    metadata = metadata or {}
-    safe_text = text or extracted_text or ""
-
+    # ROUTING
     result_for_router = {
         "category": final_category,
         "confidence": confidence,
         "metadata": metadata,
-        "text": safe_text,
+        "text": text,
         "filename": ai_filename,
     }
 
-    # ---------------------------------------------------------
-    # DATE EXTRACTION FOR ROUTING (Option C)
-    # ---------------------------------------------------------
-    try:
-        created_date = metadata.get("created_date")
-        if isinstance(created_date, str):
-            created_date = datetime.fromisoformat(created_date)
-
-        if not created_date:
-            created_ts = os.path.getmtime(path)
-            created_date = datetime.fromtimestamp(created_ts)
-    except Exception:
-        created_date = None
-
-    # Subcategory for routing
-    subcategory = None
-    if final_category == "photos":
-        subcategory = "photos"
-    elif final_category == "videos":
-        subcategory = "videos"
-
-    # Ensure extension matches storage file
-    storage_ext = os.path.splitext(storage_path)[1].lower()
-    base_name, _ = os.path.splitext(ai_filename or original_name)
-    ai_filename = base_name + storage_ext
-    result_for_router["filename"] = ai_filename
-
-    # ---------------------------------------------------------
-    # FINAL FILENAME (your new rules)
-    # ---------------------------------------------------------
     final_filename = generate_final_filename(result_for_router, storage_path, log)
+    destination = route_file(final_category, final_filename, config, log)
 
-    # ---------------------------------------------------------
-    # ROUTING
-    # ---------------------------------------------------------
-    destination = route_file(
-        final_category,
-        final_filename,
-        config,
-        log,
-        created_date=created_date,
-        subcategory=subcategory
-    )
+    # MOVE FILE
+    try:
+        shutil.move(storage_path, destination)
+    except Exception as e:
+        log(f"[MOVE] Failed: {e}", "error")
 
-    destination = ensure_unique_filename(destination)
-
-    # Dashboard event
-    from v3_debug_dashboard import add_event
+    # DASHBOARD EVENT
     add_event({
         "original": original_name,
         "category": final_category,
-        "gemini_category": category,
-        "smart_category": final_category,
-        "gemini_filename": ai_filename,
-        "v3_filename": final_filename,
+        "confidence": confidence,
         "final_filename": final_filename,
         "metadata": metadata,
         "reasoning": reasoning,
-        "text": safe_text,
+        "text": text,
     })
 
-    # ---------------------------------------------------------
-    # MOVE FILE
-    # ---------------------------------------------------------
-    ok = move_with_retry(storage_path, destination)
+    return {
+        "status": "Completed",
+        "category": final_category,
+        "confidence": confidence,
+        "summary": reasoning or text[:200],
+        "final_filename": final_filename,
+    }
 
-    if ok:
-        # Cleanup original image if converted to PDF
-        if storage_path != classification_path and os.path.splitext(classification_path)[1].lower() in photo_exts:
-            try:
-                os.remove(classification_path)
-                log(f"[CLEANUP] Removed original image after routing: {classification_path}", "diag")
-            except Exception as e:
-                log(f"[CLEANUP] Could not remove original image: {e}", "warn")
 
-        log("✅ FILE ROUTED", "success")
-        log(f"Original file : {os.path.basename(storage_path)}", "info")
-        log(f"Category      : {final_category}", "info")
-        log(f"New name      : {os.path.basename(destination)}", "info")
-        log(f"Destination   : {destination}", "info")
-        log(f"📄 {os.path.basename(storage_path)} → [{final_category}] → {destination}", "success")
-    else:
-        log(f"[ERROR] Failed to move after retries: {storage_path} → {destination}", "error")
-
-# ---------------------------------------------------------
-# INITIAL SCAN
-# ---------------------------------------------------------
-def initial_scan(cfg: dict, work_queue: mp.Queue):
-    groups = cfg.get("observer_groups", {})
-    initial_groups = cfg.get("initial_scan_groups", [])
-
-    for group_name in initial_groups:
-        paths = groups.get(group_name, [])
-        for folder in paths:
-            if not os.path.exists(folder):
-                continue
-
-            log(f"Initial scan of: {folder}", "diag")
-
-            try:
-                for root, dirs, files in os.walk(folder):
-                    for fname in files:
-                        full_path = os.path.join(root, fname)
-                        log(f"[INITIAL] Queueing: {full_path}", "diag")
-                        work_queue.put(full_path)
-            except Exception as e:
-                log(f"Initial scan error in {folder}: {e}", "error")
-
-# ---------------------------------------------------------
-# WORKER LOOP
-# ---------------------------------------------------------
-def worker_loop(work_queue: mp.Queue, config: dict):
-    while True:
-        try:
-            path = work_queue.get()
-            if path is None:
-                break
-            classify_and_route(path, config)
-        except Exception as e:
-            log(f"Worker error: {e}\n{traceback.format_exc()}", "error")
-
-# ---------------------------------------------------------
-# MAIN ENTRY POINT
-# ---------------------------------------------------------
-def main():
-    cfg = load_config()
-    if not cfg:
-        log("No valid config loaded. Exiting.", "error")
-        return
-
-    validate_and_repair_folders(cfg)
-
-    # Worker process
-    work_queue = mp.Queue()
-    worker = mp.Process(
-        target=worker_loop,
-        args=(work_queue, cfg),
-        daemon=True
-    )
-    worker.start()
-
-    # Initial scan
-    initial_scan(cfg, work_queue)
-
-    # Start OneDrive-safe watchers
-    from onedrive_safe_watcher import start_onedrive_safe_watchers
-
-    start_onedrive_safe_watchers(
-        cfg["observer_groups"],
-        lambda path: work_queue.put(path),
-        log
-    )
-
-    # Start dashboard
-    start_dashboard(port=8765)
-
-    log("Smart Sorter V5 is running. Press Ctrl+C to stop.", "info")
-
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        log("Shutting down...", "info")
-        work_queue.put(None)
-        worker.join()
-
-if __name__ == "__main__":
-    mp.freeze_support()
-    main()
 
