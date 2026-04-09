@@ -11,6 +11,13 @@ import fitz
 import docx
 import google.generativeai as genai
 
+def load_config():
+    import json, os
+    with open("config.json", "r") as f:
+        config = json.load(f)
+    config["ai"]["api_key"] = os.getenv("GEMINI_API_KEY")
+    return config
+
 from ai_classifier import (
     classify_document_smart,
     generate_filename,
