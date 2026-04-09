@@ -22,24 +22,19 @@ CONFIDENCE_REFINE = 0.70
 # ---------------------------------------------------------
 def ai_request(prompt: str, model: str, temperature: float = 0.0):
     try:
-        resp = client.generate(
+        resp = client.models.generate_content(
             model=model,
-            prompt=prompt,
-            options={"temperature": temperature},
-            stream=False
+            contents=prompt,
+            generation_config={
+                "temperature": temperature
+            }
         )
-
-        if isinstance(resp, dict):
-            return (resp.get("response") or "").strip()
-
-        if hasattr(resp, "response"):
-            return str(resp.response).strip()
-
-        return str(resp).strip()
+        return resp.text.strip()
 
     except Exception as e:
         log(f"AI request failed: {e}", "error")
         return ""
+
 
 # ---------------------------------------------------------
 # CODE-FENCE STRIPPER
