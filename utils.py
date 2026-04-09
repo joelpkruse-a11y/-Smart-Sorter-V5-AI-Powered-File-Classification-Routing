@@ -15,6 +15,17 @@ ALLOWED_EXTENSIONS = {
 }
 
 # ---------------------------------------------------------
+# LOGGING HELPER (Smart Sorter V5 expects this)
+# ---------------------------------------------------------
+def log(message: str):
+    """
+    Simple logging helper used by Smart Sorter V5.
+    Prints messages with a consistent prefix.
+    """
+    print(f"[SMART SORTER] {message}")
+
+
+# ---------------------------------------------------------
 # 1. EXTENSION VALIDATION
 # ---------------------------------------------------------
 def allowed_file(filename: str) -> bool:
@@ -135,15 +146,8 @@ def extract_image_text(filepath: str) -> str:
     try:
         img = Image.open(filepath)
         text = pytesseract.image_to_string(img)
-
-        def log(message: str):
-    """
-    Simple logging helper used by Smart Sorter V5.
-    Prints messages with a consistent prefix.
-    """
-    print(f"[SMART SORTER] {message}")
-
         return text or ""
     except Exception as e:
         logging.error(f"[utils] OCR extraction failed: {e}")
         return ""
+
