@@ -11,7 +11,7 @@ client = Client(host="http://localhost:11434")
 
 # Default models (Smart Sorter may override)
 AI_MODEL_FAST = "qwen2.5:0.5b"
-AI_MODEL_SLOW = "qwen2.5:1.5b"
+AI_MODEL_SLOW = "gemini-2.5-pro"
 
 # Smart Mode thresholds
 CONFIDENCE_ACCEPT = 0.90
