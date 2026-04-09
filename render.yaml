@@ -5,17 +5,16 @@ services:
     plan: starter
 
     # Pin Python to a wheel-supported version
-    pythonVersion: 3.12.0
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.2
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.0-flash
 
-    # Build & start commands
     buildCommand: pip install -r requirements.txt
     startCommand: python smart_sorter_web.py
 
     autoDeploy: true
 
-    # Environment variables
-    envVars:
-      - key: GEMINI_API_KEY
-        sync: false
-      - key: GEMINI_MODEL
-        value: gemini-2.0-flash
