@@ -13,19 +13,24 @@ from flask import (
     jsonify,
 )
 
-from smart_sorter_v5 import classify_and_route, load_config
+# V6 pipeline + config
+from smart_sorter_v6 import classify_and_route_v6, load_config_v6
 
 app = Flask(__name__)
 
-# Load Smart Sorter config once
-config = load_config()
+# Load Smart Sorter V6 config once (Render-friendly: allow override via env)
+CONFIG_PATH = os.getenv("SMART_SORTER_CONFIG", "config.json")
+config = load_config_v6(CONFIG_PATH)
 
 # Folders from config
 INCOMING_FOLDER = config["paths"]["incoming"]
 PROCESSED_FOLDER = config["paths"]["processed"]
 
 # Optional logs path (best-effort)
-LOG_FILE = config["paths"].get("logs", os.path.join(os.path.dirname(__file__), "smart_sorter.log"))
+LOG_FILE = config["paths"].get(
+    "logs",
+    os.path.join(os.path.dirname(__file__), "smart_sorter.log")
+)
 
 # Ensure preview folder exists (for UI thumbnails)
 PREVIEW_FOLDER = os.path.join(os.path.dirname(__file__), "upload_previews")
@@ -35,14 +40,14 @@ os.makedirs(PREVIEW_FOLDER, exist_ok=True)
 uploads = []
 
 # ---------------------------
-# HTML TEMPLATE (SIDEBAR + PAGES)
+# HTML TEMPLATE (unchanged UI)
 # ---------------------------
 HTML_TEMPLATE = '''
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Smart Sorter V5 – Dashboard</title>
+<title>Smart Sorter V6 – Dashboard</title>
 
 <style>
 :root {
@@ -473,7 +478,7 @@ th {
         <div class="sidebar-logo">SS</div>
         <div class="sidebar-title">
             <span>Smart Sorter</span>
-            <span>V5 Dashboard</span>
+            <span>V6 Dashboard</span>
         </div>
     </div>
 
@@ -766,7 +771,6 @@ def get_logs():
     try:
         with open(LOG_FILE, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-        # Optionally truncate to last N chars
         content = content[-8000:]
         return jsonify({"logs": content})
     except Exception as e:
@@ -809,7 +813,8 @@ def upload_file():
 
         def process_file(path, record, original_name):
             try:
-                result = classify_and_route(path, config)
+                # V6 deterministic pipeline
+                result = classify_and_route_v6(path, config)
 
                 record['status'] = 'Completed'
                 if isinstance(result, dict):
@@ -853,5 +858,6 @@ def upload_file():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True)
+
 
 
