@@ -68,7 +68,7 @@ HTML_TEMPLATE = """<!doctype html>
                  "Segoe UI", sans-serif;
 }
 
-/* Light theme overrides (used when OS is light or user forces light) */
+/* Light theme overrides */
 :root[data-theme="light"] {
     --bg: #f3f4f6;
     --bg-elevated: #ffffff;
@@ -592,7 +592,7 @@ body {
     }
 }
 
-/* OS theme auto-detect base (JS will set data-theme) */
+/* OS theme auto-detect base */
 @media (prefers-color-scheme: light) {
     :root:not([data-theme]) {
         color-scheme: light;
@@ -761,7 +761,7 @@ body {
                             <div class="path">{{ f.rel_path }}</div>
                         </div>
                         <div>
-                            <a href="{{ url_for('download_processed', filename=f.name) }}" class="download-btn">
+                            <a href="{{ url_for('download_processed', filename=f.rel_path) }}" class="download-btn">
                                 <span class="material-icon">download</span>
                                 <span>Download</span>
                             </a>
@@ -971,9 +971,21 @@ def preview_file(filename):
 
 @app.route('/download/<path:filename>')
 def download_processed(filename):
+    # 1) Treat `filename` as a relative path under PROCESSED_FOLDER
+    candidate = os.path.join(PROCESSED_FOLDER, filename)
+    if os.path.isfile(candidate):
+        return send_from_directory(
+            os.path.dirname(candidate),
+            os.path.basename(candidate),
+            as_attachment=True
+        )
+
+    # 2) Fallback: treat `filename` as a bare name and search recursively
+    bare = os.path.basename(filename)
     for root, dirs, files in os.walk(PROCESSED_FOLDER):
-        if filename in files:
-            return send_from_directory(root, filename, as_attachment=True)
+        if bare in files:
+            return send_from_directory(root, bare, as_attachment=True)
+
     return "File not found", 404
 
 @app.route('/delete_processed', methods=['POST'])
