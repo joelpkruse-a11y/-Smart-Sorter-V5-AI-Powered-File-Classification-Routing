@@ -658,7 +658,7 @@ body {
         <div class="upload-box">
             <h3>Upload a File</h3>
             <p class="muted">Drag & drop a file below or click to browse.</p>
-            <form id="uploadForm" method="post" enctype="multipart/form-data">
+            <form id="uploadForm" action="/" method="post" enctype="multipart/form-data">
                 <label class="drop-zone" id="dropZone">
                     <span id="dropText">Drop file here or click to select</span>
                     <input type="file" name="file" id="fileInput" required>
