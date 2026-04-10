@@ -227,6 +227,7 @@ def convert_image_to_clean_pdf(image_path: str, log) -> str:
 # RENDER-SAFE CLASSIFICATION ENTRYPOINT
 # ---------------------------------------------------------
 def process_file_for_web(path: str, config: dict) -> dict:
+def process_file_for_web(path: str, config: dict) -> dict:
     """
     Unified entrypoint for the Flask dashboard.
     Produces:
@@ -253,7 +254,7 @@ def process_file_for_web(path: str, config: dict) -> dict:
             log=log
         )
 
-        # 4) Merge summary into result
+        # 4) Assign summary (correct indentation)
         result["summary"] = summary_result.get("text", "")
 
         return result
@@ -261,6 +262,7 @@ def process_file_for_web(path: str, config: dict) -> dict:
     except Exception as e:
         log(f"[WEB] Error: {e}", "error")
         return {"status": "Failed", "summary": str(e)}
+
 
 # ---------------------------------------------------------
 # INTERNAL PIPELINE (same as V5, minus watchers)
