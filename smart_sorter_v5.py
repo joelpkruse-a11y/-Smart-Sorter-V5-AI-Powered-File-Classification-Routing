@@ -7,120 +7,64 @@ import traceback
 from datetime import datetime
 import re
 
-import fitz
+# Third‑party libraries
+import fitz  # PyMuPDF
 import docx
 import google.generativeai as genai
-
-def load_config():
-    import json, os
-    with open("config.json", "r") as f:
-        config = json.load(f)
-    config["ai"]["api_key"] = os.getenv("GEMINI_API_KEY")
-    return config
-
-from ai_classifier import (
-    classify_document_smart,
-    generate_filename,
-)
-
-from smart_mode_v2 import smart_mode_v2
-from filename_router import generate_final_filename, route_file
-from v3_debug_dashboard import add_event
-
 from PIL import Image
 import numpy as np
 
+# Optional dependencies
 try:
     import cv2
     HAS_CV2 = True
 except Exception:
     HAS_CV2 = False
 
-print("[DEBUG] Loaded smart_sorter_v5 (Render Edition) from:", __file__)
+# Local modules (kept, but imports reorganized)
+from ai_classifier import (
+    classify_document_smart,
+    generate_filename,
+)
+from smart_mode_v2 import smart_mode_v2
+from filename_router import generate_final_filename, route_file
+from v3_debug_dashboard import add_event
+from metadata_enhancer import enhance_metadata
+
+print("[DEBUG] Loaded smart_sorter_v5 (V5.1, unified AI pipeline) from:", __file__)
 
 # ---------------------------------------------------------
-#gemini-2.5-pro scaffolding
+# Config loading
+# ---------------------------------------------------------
+def load_config():
+    """
+    Load config.json and inject GEMINI_API_KEY from environment.
+    """
+    with open("config.json", "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    # Inject API key from environment
+    ai_cfg = config.get("ai") or {}
+    ai_cfg["api_key"] = os.getenv("GEMINI_API_KEY")
+    config["ai"] = ai_cfg
+
+    return config
+
+# ---------------------------------------------------------
+# Gemini scaffolding
 # ---------------------------------------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
 
+
 def _init_gemini():
+    """
+    Initialize Gemini SDK with API key from environment.
+    Raises RuntimeError if key is missing.
+    """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not set")
     genai.configure(api_key=GEMINI_API_KEY)
-
-def gemini_process_document(
-    *,
-    path: str,
-    text: str,
-    filename: str,
-    config: dict,
-    log,
-    tables_vision=None,
-    metadata_vision=None,
-) -> dict:
-    """Strict JSON gemini-2.5-pro classification."""
-    _init_gemini()
-
-    tables_vision = tables_vision or []
-    metadata_vision = metadata_vision or {}
-
-    ai_cfg = (config.get("ai") or {})
-    filename_style = ai_cfg.get("filename_style", "semantic-kebab")
-
-    classification_cfg = (config.get("classification") or {})
-    categories = classification_cfg.get("categories", [])
-    category_names = [c.get("name", "other") for c in categories]
-
-    prompt = f"""
-You are Smart Sorter V5 running on gemini-2.5-pro.
-
-You must:
-1. Classify the document into ONE of these categories: {category_names}
-2. Provide a confidence score between 0 and 1.
-3. Provide a short reasoning string.
-4. Suggest a semantic filename using style "{filename_style}".
-5. Return STRICT JSON only.
-
-Input filename: {filename}
-
-Vision metadata:
-{json.dumps(metadata_vision, ensure_ascii=False, indent=2)}
-
-Document text:
-\"\"\"{(text or '')[:4000]}\"\"\"
-
-JSON response shape:
-{{
-  "text": "string",
-  "category": "string",
-  "confidence": 0.0,
-  "metadata": {{}},
-  "tables": [],
-  "filename": "string",
-  "reasoning": "string"
-}}
-"""
-
-    model = genai.GenerativeModel(GEMINI_MODEL)
-    resp = model.generate_content(prompt)
-
-    try:
-        data = json.loads(resp.text)
-    except Exception as e:
-        log(f"[AI] Gemini JSON parse failed: {e}", "error")
-        return {}
-
-    # Defaults
-    data.setdefault("text", text or "")
-    data.setdefault("category", "other")
-    data.setdefault("confidence", 0.0)
-    data.setdefault("metadata", {})
-    data.setdefault("tables", [])
-    data.setdefault("filename", filename)
-    data.setdefault("reasoning", "")
-
-    return data
 
 # ---------------------------------------------------------
 # Logging
@@ -134,7 +78,11 @@ COLOR_MAP = {
     "reset": "\033[0m",
 }
 
+
 def log(msg: str, level: str = "info"):
+    """
+    Color‑coded console logger, Render‑safe.
+    """
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     color = COLOR_MAP.get(level, COLOR_MAP["info"])
     reset = COLOR_MAP["reset"]
@@ -148,9 +96,15 @@ def clean_extracted_text(text: str) -> str:
     cleaned = [line.strip() for line in lines if line.strip()]
     return "\n".join(cleaned)
 
+
 def extract_text_generic(path: str) -> str:
+    """
+    Generic text extraction for txt, md, log, csv, docx, pdf, xlsx.
+    Returns a cleaned string (may be empty on failure).
+    """
     ext = os.path.splitext(path)[1].lower()
 
+    # Plain text‑like
     if ext in [".txt", ".md", ".log", ".csv"]:
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -158,6 +112,7 @@ def extract_text_generic(path: str) -> str:
         except Exception:
             return ""
 
+    # DOCX
     if ext == ".docx":
         try:
             doc = docx.Document(path)
@@ -166,6 +121,7 @@ def extract_text_generic(path: str) -> str:
         except Exception:
             return ""
 
+    # PDF
     if ext == ".pdf":
         try:
             doc = fitz.open(path)
@@ -175,6 +131,7 @@ def extract_text_generic(path: str) -> str:
         except Exception:
             return ""
 
+    # XLSX
     if ext == ".xlsx":
         try:
             import openpyxl
@@ -191,12 +148,17 @@ def extract_text_generic(path: str) -> str:
         except Exception:
             return ""
 
+    # Fallback
     return ""
 
 # ---------------------------------------------------------
 # IMAGE → CLEAN PDF
 # ---------------------------------------------------------
-def convert_image_to_clean_pdf(image_path: str, log) -> str:
+def convert_image_to_clean_pdf(image_path: str, log_fn=log) -> str:
+    """
+    Convert an image to a cleaned, high‑contrast PDF for better OCR/vision.
+    Returns the new PDF path, or the original image path on failure.
+    """
     base, _ = os.path.splitext(image_path)
     pdf_path = base + "_cleaned.pdf"
 
@@ -207,66 +169,139 @@ def convert_image_to_clean_pdf(image_path: str, log) -> str:
         if img_np.ndim == 3 and HAS_CV2:
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
             bw = cv2.adaptiveThreshold(
-                gray, 255,
+                gray,
+                255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY,
-                35, 10
+                35,
+                10,
             )
             Image.fromarray(bw).save(pdf_path, "PDF", resolution=300)
         else:
             img.convert("L").save(pdf_path, "PDF", resolution=300)
 
-        log(f"[PDF] Converted to cleaned PDF: {pdf_path}", "diag")
+        log_fn(f"[PDF] Converted to cleaned PDF: {pdf_path}", "diag")
         return pdf_path
 
     except Exception as e:
-        log(f"[PDF] Conversion failed: {e}", "warn")
+        log_fn(f"[PDF] Conversion failed: {e}", "warn")
         return image_path
 
 # ---------------------------------------------------------
-# RENDER-SAFE CLASSIFICATION ENTRYPOINT
+# GEMINI: UNIFIED CLASSIFICATION + SUMMARY
 # ---------------------------------------------------------
-def process_file_for_web(path: str, config: dict) -> dict:
+def gemini_process_document(
+    *,
+    path: str,
+    text: str,
+    filename: str,
+    config: dict,
+    log_fn=log,
+) -> dict:
     """
-    Unified entrypoint for the Flask dashboard.
-    Produces:
+    Unified Gemini call:
+      - Classify into a category
+      - Provide confidence
+      - Provide reasoning
+      - Suggest semantic filename
+      - Provide a concise summary
+      - Return STRICT JSON
+
+    Returns a dict with at least:
+      - text
       - category
       - confidence
+      - metadata
+      - tables
+      - filename
+      - reasoning
       - summary
-      - final_filename
     """
+    _init_gemini()
+
+    ai_cfg = (config.get("ai") or {})
+    filename_style = ai_cfg.get("filename_style", "semantic-kebab")
+
+    classification_cfg = (config.get("classification") or {})
+    categories = classification_cfg.get("categories", [])
+    category_names = [c.get("name", "other") for c in categories]
+
+    # Truncate text for prompt safety
+    prompt_text = (text or "")[:4000]
+
+    prompt = f"""
+You are Smart Sorter V5.1 running on {GEMINI_MODEL}.
+
+Your job:
+1. Classify the document into ONE of these categories (best fit only):
+   {category_names}
+2. Provide a confidence score between 0 and 1 (float).
+3. Provide a short reasoning string explaining the classification.
+4. Suggest a semantic filename using style "{filename_style}" (no extension).
+5. Provide a concise, user‑friendly summary of the document (2–6 sentences).
+6. Return STRICT JSON only. No extra text, no markdown, no commentary.
+
+Input filename: {filename}
+
+Document text (truncated):
+\"\"\"{prompt_text}\"\"\"
+
+JSON response shape (STRICT):
+{{
+  "text": "string",          // cleaned or representative text (may reuse input)
+  "category": "string",      // one of {category_names}
+  "confidence": 0.0,         // float between 0 and 1
+  "metadata": {{}},          // optional structured metadata
+  "tables": [],              // optional table structures
+  "filename": "string",      // semantic filename (no extension)
+  "reasoning": "string",     // short explanation of classification
+  "summary": "string"        // concise user‑friendly summary
+}}
+"""
+
+    model = genai.GenerativeModel(GEMINI_MODEL)
+    resp = model.generate_content(prompt)
+
     try:
-        # 1) Run classification + routing
-        result = _classify_and_route_internal(path, config)
-        if not result:
-            return {"status": "Failed"}
-
-        # 2) Extract text for summary
-        text = result.get("extracted_text") or result.get("ocr_text") or ""
-
-        # 3) Run summary engine
-        summary_result = gemini_process_document(
-            path=path,
-            text=text,
-            filename=result.get("final_filename"),
-            config=config,
-            log=log
-        )
-
-        # 4) Assign summary (correct indentation)
-        result["summary"] = summary_result.get("text", "")
-
-        return result
-
+        data = json.loads(resp.text)
     except Exception as e:
-        log(f"[WEB] Error: {e}", "error")
-        return {"status": "Failed", "summary": str(e)}
+        log_fn(f"[AI] Gemini JSON parse failed: {e}", "error")
+        return {}
 
+    # Defaults / normalization
+    data.setdefault("text", text or "")
+    data.setdefault("category", "other")
+    data.setdefault("confidence", 0.0)
+    data.setdefault("metadata", {})
+    data.setdefault("tables", [])
+    data.setdefault("filename", filename)
+    data.setdefault("reasoning", "")
+    data.setdefault("summary", "")
 
+    # Type safety
+    try:
+        data["confidence"] = float(data.get("confidence", 0.0))
+    except Exception:
+        data["confidence"] = 0.0
+
+    return data
+
+    # ---------------------------------------------------------
+# INTERNAL PIPELINE (V5.1 unified AI)
 # ---------------------------------------------------------
-# INTERNAL PIPELINE (same as V5, minus watchers)
-# ---------------------------------------------------------
-def _classify_and_route_internal(path: str, config: dict):
+def _classify_and_route_internal(path: str, config: dict) -> dict:
+    """
+    Internal pipeline:
+      - Validate file
+      - Determine type (photo, video, document)
+      - Extract text (for documents)
+      - Call Gemini once for classification + summary
+      - Apply Smart Mode V2
+      - Generate final filename
+      - Route file
+      - Emit dashboard event
+      - Return a rich result dict for the web dashboard
+    """
     if not os.path.exists(path):
         return {"status": "Failed", "summary": "File missing"}
 
@@ -277,7 +312,7 @@ def _classify_and_route_internal(path: str, config: dict):
     photo_exts = [e.lower() for e in classification_cfg.get("photo_extensions", [])]
     video_exts = [e.lower() for e in classification_cfg.get("video_extensions", [])]
 
-    # Metadata
+    # Filesystem metadata
     try:
         stat = os.stat(path)
         metadata_fs = {
@@ -295,18 +330,20 @@ def _classify_and_route_internal(path: str, config: dict):
     extracted_text = ""
     metadata = dict(metadata_fs)
     reasoning = ""
+    summary_text = ""
     treat_as_document = False
 
     classification_path = path
     storage_path = path
 
-    # XLSX always document
+    # XLSX always treated as document
     if ext == ".xlsx":
         treat_as_document = True
 
     # PHOTO DETECTION
     if ext in photo_exts:
-        treat_as_document = False  # simplified for Render
+        # For now, keep photos as non‑document for Render safety
+        treat_as_document = False
         if not treat_as_document:
             category = "photos"
             confidence = 1.0
@@ -318,41 +355,42 @@ def _classify_and_route_internal(path: str, config: dict):
         confidence = 1.0
         ai_filename = original_name
 
-    # DOCUMENT-PHOTO → PDF
+    # DOCUMENT‑PHOTO → PDF (if we ever flip treat_as_document=True for photos)
     if ext in photo_exts and treat_as_document:
         storage_path = convert_image_to_clean_pdf(path, log)
-        classification_path = path
+        classification_path = storage_path
 
-    # NON-PHOTO DOCUMENT
+    # NON‑PHOTO DOCUMENT → extract text
     if ext not in photo_exts:
         extracted_text = extract_text_generic(classification_path)
 
-    # GEMINI CLASSIFICATION
+    # GEMINI CLASSIFICATION + SUMMARY (documents and also as a fallback for others)
     gemini_result = gemini_process_document(
         path=classification_path,
         text=extracted_text,
         filename=original_name,
         config=config,
-        log=log,
+        log_fn=log,
     )
 
     if gemini_result:
         text = gemini_result.get("text", "") or extracted_text
-        category = gemini_result.get("category", "other")
-        confidence = float(gemini_result.get("confidence", 0.0))
+        category = gemini_result.get("category", category or "other")
+        confidence = float(gemini_result.get("confidence", confidence or 0.0))
         metadata_ai = gemini_result.get("metadata") or {}
-        ai_filename = gemini_result.get("filename") or original_name
-        reasoning = gemini_result.get("reasoning", "")
+        ai_filename = gemini_result.get("filename") or ai_filename or original_name
+        reasoning = gemini_result.get("reasoning", "") or reasoning
+        summary_text = gemini_result.get("summary", "") or summary_text
 
-        from metadata_enhancer import enhance_metadata
+        # Metadata enhancement
         metadata = enhance_metadata(
             text=text,
             metadata_ai=metadata_ai,
             metadata_vision={},
-            metadata_fs=metadata_fs
+            metadata_fs=metadata_fs,
         )
 
-    # FALLBACK FILENAME
+    # FALLBACK FILENAME if Gemini didn't provide one
     if not ai_filename:
         ai_filename = generate_filename(
             text=text,
@@ -361,7 +399,7 @@ def _classify_and_route_internal(path: str, config: dict):
             metadata=metadata,
         )
 
-    # SMART MODE
+    # SMART MODE V2
     result_for_smart = {
         "category": category,
         "confidence": confidence,
@@ -389,23 +427,58 @@ def _classify_and_route_internal(path: str, config: dict):
         log(f"[MOVE] Failed: {e}", "error")
 
     # DASHBOARD EVENT
-    add_event({
-        "original": original_name,
-        "category": final_category,
-        "confidence": confidence,
-        "final_filename": final_filename,
-        "metadata": metadata,
-        "reasoning": reasoning,
-        "text": text,
-    })
+    add_event(
+        {
+            "original": original_name,
+            "category": final_category,
+            "confidence": confidence,
+            "final_filename": final_filename,
+            "metadata": metadata,
+            "reasoning": reasoning,
+            "text": text,
+        }
+    )
+
+    # Final summary fallback chain
+    final_summary = summary_text or reasoning or text[:200]
 
     return {
         "status": "Completed",
         "category": final_category,
         "confidence": confidence,
-        "summary": reasoning or text[:200],
+        "summary": final_summary,
         "final_filename": final_filename,
+        "extracted_text": extracted_text,
+        "ocr_text": None,
+        "text": text,
     }
+# ---------------------------------------------------------
+# RENDER‑SAFE ENTRYPOINT FOR FLASK DASHBOARD
+# ---------------------------------------------------------
+def process_file_for_web(path: str, config: dict) -> dict:
+    """
+    Unified entrypoint for the Flask dashboard.
+
+    Produces a dict with at least:
+      - status
+      - category
+      - confidence
+      - summary
+      - final_filename
+      - extracted_text
+      - ocr_text
+      - text
+    """
+    try:
+        result = _classify_and_route_internal(path, config)
+        if not result:
+            return {"status": "Failed", "summary": "Empty result from pipeline"}
+        return result
+
+    except Exception as e:
+        log(f"[WEB] Error: {e}", "error")
+        traceback.print_exc()
+        return {"status": "Failed", "summary": str(e)}
 
 
 
