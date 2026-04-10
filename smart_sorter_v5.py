@@ -227,7 +227,6 @@ def convert_image_to_clean_pdf(image_path: str, log) -> str:
 # RENDER-SAFE CLASSIFICATION ENTRYPOINT
 # ---------------------------------------------------------
 def process_file_for_web(path: str, config: dict) -> dict:
-def process_file_for_web(path: str, config: dict) -> dict:
     """
     Unified entrypoint for the Flask dashboard.
     Produces:
