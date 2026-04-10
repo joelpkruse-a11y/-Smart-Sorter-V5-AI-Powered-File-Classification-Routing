@@ -7,12 +7,25 @@ from werkzeug.utils import secure_filename
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document
 from PIL import Image
-import pytesseract
 
+# ---------------------------------------------------------
+# OPTIONAL: pytesseract (Render-safe import)
+# ---------------------------------------------------------
+try:
+    import pytesseract
+    HAS_PYTESSERACT = True
+except Exception:
+    HAS_PYTESSERACT = False
+
+
+# ---------------------------------------------------------
 # Allowed extensions for uploads
+# ---------------------------------------------------------
 ALLOWED_EXTENSIONS = {
-    "pdf", "docx", "txt", "png", "jpg", "jpeg", "tiff", "bmp", "gif"
+    "pdf", "docx", "txt",
+    "png", "jpg", "jpeg", "tiff", "bmp", "gif"
 }
+
 
 # ---------------------------------------------------------
 # LOGGING HELPER (Smart Sorter V5 expects this)
@@ -66,6 +79,9 @@ def extract_text(filepath: str) -> str:
     Extracts text from PDF, DOCX, TXT, or image files.
     Returns extracted text or an empty string on failure.
     """
+    if "." not in filepath:
+        return ""
+
     ext = filepath.rsplit(".", 1)[1].lower()
 
     try:
@@ -137,12 +153,17 @@ def extract_txt_text(filepath: str) -> str:
 
 
 # ---------------------------------------------------------
-# 7. IMAGE OCR EXTRACTION
+# 7. IMAGE OCR EXTRACTION (Render-safe)
 # ---------------------------------------------------------
 def extract_image_text(filepath: str) -> str:
     """
     Extracts text from images using Tesseract OCR.
+    Render-safe: gracefully disables OCR if pytesseract is unavailable.
     """
+    if not HAS_PYTESSERACT:
+        logging.warning("[utils] pytesseract not available — skipping OCR")
+        return ""
+
     try:
         img = Image.open(filepath)
         text = pytesseract.image_to_string(img)
@@ -150,4 +171,3 @@ def extract_image_text(filepath: str) -> str:
     except Exception as e:
         logging.error(f"[utils] OCR extraction failed: {e}")
         return ""
-
