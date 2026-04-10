@@ -228,16 +228,36 @@ def convert_image_to_clean_pdf(image_path: str, log) -> str:
 # ---------------------------------------------------------
 def process_file_for_web(path: str, config: dict) -> dict:
     """
-    This is the ONLY entrypoint your Flask dashboard should call.
-    It returns a dict with:
+    Unified entrypoint for the Flask dashboard.
+    Produces:
       - category
       - confidence
       - summary
       - final_filename
     """
     try:
+        # 1) Run classification + routing
         result = _classify_and_route_internal(path, config)
-        return result or {"status": "Failed"}
+        if not result:
+            return {"status": "Failed"}
+
+        # 2) Extract text for summary
+        text = result.get("extracted_text") or result.get("ocr_text") or ""
+
+        # 3) Run summary engine
+        summary_result = gemini_process_document(
+            path=path,
+            text=text,
+            filename=result.get("final_filename"),
+            config=config,
+            log=log
+        )
+
+        # 4) Merge summary into result
+        result["summary"] = summary_result.get("text", "")
+
+        return result
+
     except Exception as e:
         log(f"[WEB] Error: {e}", "error")
         return {"status": "Failed", "summary": str(e)}
