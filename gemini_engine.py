@@ -296,13 +296,13 @@ def gemini_process_document(
         log("[AI] Gemini disabled in config.json — skipping.", "diag")
         return _fallback_local_classifier(text or "", log)
 
-    api_key = gconf.get("api_key")
+    api_key = os.getenv("GEMINI_API_KEY") or gconf.get("api_key")
     if not api_key:
-        log("[AI] Gemini API key missing.", "error")
+        log("[AI] GEMINI_API_KEY missing from environment.", "error")
         return _fallback_local_classifier(text or "", log)
 
-    model = gconf["model"]
-
+    model = os.getenv("GEMINI_MODEL") or gconf.get("model") or "gemini-2.5-pro"
+    
     # Endpoint per current Gemini REST docs
     # POST https://generativelanguage.googleapis.com/v1beta/{model=models/*}:generateContent
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
