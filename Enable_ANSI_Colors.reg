@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CURRENT_USER\Console]
+"VirtualTerminalLevel"=dword:00000001
+
+[HKEY_CURRENT_USER\Console\%SystemRoot%_system32_WindowsPowerShell_v1.0_powershell.exe]
+"VirtualTerminalLevel"=dword:00000001
+
+[HKEY_CURRENT_USER\Console\%SystemRoot%_system32_cmd.exe]
+"VirtualTerminalLevel"=dword:00000001
+
+[HKEY_CURRENT_USER\Console\Windows Terminal]
+"VirtualTerminalLevel"=dword:00000001
+
+[HKEY_CURRENT_USER\Console\Git Bash]
+"VirtualTerminalLevel"=dword:00000001
+
+[HKEY_CURRENT_USER\Console\pwsh.exe]
+"VirtualTerminalLevel"=dword:00000001

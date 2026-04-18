@@ -1,0 +1,2189 @@
+# =========================================================
+# SMART SORTER V5.3 — MONOLITHIC EDITION
+# Section A — Imports, Config, Logging, Utilities
+# =========================================================
+
+import os
+import sys
+import time
+import json
+import shutil
+import logging
+import threading
+import re
+import hashlib
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+
+# =========================================================
+# AI ENGINE IMPORTS
+# =========================================================
+from ai_engine import (
+    run_full_retry_pipeline,
+    build_v3_filename,
+    ensure_category_folder,
+    _extract_issuer,
+    dump_ai_debug,
+)
+
+from photo_duplicates import (
+    is_photo_duplicate,
+    detect_faces_google_vision,
+    detect_labels_google_vision,
+    save_photo_metadata,
+    sha256_hash,
+    perceptual_hash,
+    extract_photo_metadata
+)
+
+
+# =========================================================
+# UTILS IMPORTS (OCR + Logging)
+# =========================================================
+from utils import (
+    extract_text_for_ai,
+    log_info,
+    log_warn,
+    log_error,
+    log_diag,
+    log,
+)
+# ============================================================
+# GEMINI CLIENT INITIALIZATION (GLOBAL)
+# ============================================================
+from google import genai
+import os
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+else:
+    client = None
+
+def optimize_system():
+    return
+
+print("RUNNING PYTHON:", sys.executable)
+
+# Optional dependencies
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None
+    genai_types = None
+
+# ---------------------------------------------------------
+# GLOBALS & CONFIG LOADING
+# ---------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+
+CONFIG: Dict[str, Any] = {}
+
+def load_config(path: Path) -> Dict[str, Any]:
+    """Load JSON config from disk."""
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+try:
+    CONFIG = load_config(CONFIG_PATH)
+except Exception as e:
+    print(f"[FATAL] Failed to load config.json: {e}")
+    sys.exit(1)
+
+INPUT_FOLDER = Path(CONFIG.get("input_folder", "C:/SmartInboxLocal/Incoming"))
+OUTPUT_FOLDER = Path(CONFIG.get("output_folder", "C:/SmartInboxLocal/Sorted"))
+ERROR_FOLDER = Path(CONFIG.get("error_folder", str(OUTPUT_FOLDER / "_errors")))
+DESTINATIONS = CONFIG.get("destinations", {})
+CLASSIFICATION_CFG = CONFIG.get("classification", {})
+AI_CFG = CONFIG.get("ai_classification", {})
+OBSERVER_GROUPS = CONFIG.get("observer_groups", {})
+INITIAL_SCAN_GROUPS = CONFIG.get("initial_scan_groups", [])
+FILE_READINESS_CFG = CONFIG.get("file_readiness", {})
+
+PROCESSED_HASHES = set()
+
+
+# ---------------------------------------------------------
+# LOGGING SETUP
+# ---------------------------------------------------------
+
+LOG_CFG = CONFIG.get("logging", {})
+LOG_ENABLED = LOG_CFG.get("enabled", True)
+LOG_TO_FILE = LOG_CFG.get("log_to_file", True)
+LOG_FILE_PATH = LOG_CFG.get("log_file_path", "C:/SmartInbox/System/sorter.log")
+
+logger = logging.getLogger("smart_sorter")
+logger.setLevel(logging.DEBUG)
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+if LOG_ENABLED and LOG_TO_FILE:
+    log_path = Path(LOG_FILE_PATH)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(_log_formatter)
+    logger.addHandler(file_handler)
+
+# ---------------------------------------------------------
+# COLOR LOGGING (console)
+# ---------------------------------------------------------
+
+COLOR_MAP = {
+    "success": "\033[92m",
+    "error": "\033[91m",
+    "warn": "\033[93m",
+    "diag": "\033[96m",
+    "info": "\033[97m",
+    "reset": "\033[0m",
+}
+
+def log(msg: str, level: str = "info"):
+    """Color-coded console logger."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    color = COLOR_MAP.get(level, COLOR_MAP["info"])
+    reset = COLOR_MAP["reset"]
+    print(f"{color}[{level.upper()}] {ts} {msg}{reset}")
+
+    if LOG_ENABLED and LOG_TO_FILE:
+        if level == "error":
+            logger.error(msg)
+        elif level in ("warn", "warning"):
+            logger.warning(msg)
+        elif level in ("diag", "debug"):
+            logger.debug(msg)
+        else:
+            logger.info(msg)
+
+log_fn = log
+
+# ---------------------------------------------------------
+# GENERAL UTILITIES
+# ---------------------------------------------------------
+
+def ensure_folder(path: Path) -> None:
+    """Ensure a folder exists."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log_fn(f"[FS] Failed to create folder {path}: {e}", "error")
+
+def is_temp_extension(path: Path) -> bool:
+    """Check if file has a temporary extension."""
+    temp_exts = CONFIG.get("temp_extensions", [])
+    return path.suffix.lower() in [e.lower() for e in temp_exts]
+
+def is_file_stable(path: Path) -> bool:
+    """Check if file size is stable over a short interval."""
+    timeout = float(FILE_READINESS_CFG.get("timeout_seconds", 12))
+    interval = float(FILE_READINESS_CFG.get("stability_check_interval", 0.4))
+    start = time.time()
+    last_size = -1
+
+    while time.time() - start < timeout:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        if size == last_size and size > 0:
+            return True
+        last_size = size
+        time.sleep(interval)
+
+    return False
+
+def safe_move(src: Path, dst: Path) -> None:
+    """Move file with logging and folder creation."""
+    try:
+        ensure_folder(dst.parent)
+        shutil.move(str(src), str(dst))
+        log_fn(f"[FS] Moved: {src} -> {dst}", "info")
+    except Exception as e:
+        log_fn(f"[FS] Failed to move {src} -> {dst}: {e}", "error")
+
+def read_file_bytes(path: Path) -> Optional[bytes]:
+    try:
+        with path.open("rb") as f:
+            return f.read()
+    except Exception as e:
+        log_fn(f"[FS] Failed to read bytes from {path}: {e}", "error")
+        return None
+
+def read_file_text(path: Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception as e:
+        log_fn(f"[FS] Failed to read text from {path}: {e}", "error")
+        return ""
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+# =========================================================
+# Section B — Hardened JSON Repair + Regex Fallback + Retry Pipeline
+# =========================================================
+
+# ---------------------------------------------------------
+# DEBUG LOGGER FOR RAW + REPAIRED JSON
+# ---------------------------------------------------------
+
+def debug_log_failed_json(repaired: str, log_fn_ref=log_fn):
+    """Logs preview + writes full repaired JSON to a file."""
+    preview = repaired[:2000]
+    log_fn_ref("[AI] JSON PARSE FAILURE — showing repaired JSON preview:", "error")
+    log_fn_ref(preview, "error")
+
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_path = f"json_debug_{ts}.txt"
+        with open(debug_path, "w", encoding="utf-8") as f:
+            f.write(repaired)
+        log_fn_ref(f"[AI] Full repaired JSON written to {debug_path}", "error")
+    except Exception as e:
+        log_fn_ref(f"[AI] Failed to write debug JSON file: {e}", "error")
+
+
+# ---------------------------------------------------------
+# REGEX FALLBACK PARSER (NEW)
+# ---------------------------------------------------------
+
+def fallback_parse_json_like(text: str) -> Dict[str, Any]:
+    """
+    Extracts key/value pairs from malformed JSON-like text.
+    Handles patterns like:
+    "key": "value"
+    "key" "value"
+    key: value
+    key = value
+    """
+    result = {}
+
+    # "key": "value"
+    for k, v in re.findall(r'"([^"]+)"\s*[:=]\s*"([^"]+)"', text):
+        result[k.strip()] = v.strip()
+
+    # "key" "value" (missing colon)
+    for k, v in re.findall(r'"([^"]+)"\s+"([^"]+)"', text):
+        if k not in result:
+            result[k.strip()] = v.strip()
+
+    # key: value (bare keys)
+    for k, v in re.findall(r'([A-Za-z0-9_]+)\s*[:=]\s*([A-Za-z0-9_\-]+)', text):
+        if k not in result:
+            result[k.strip()] = v.strip()
+
+    return result
+
+
+# ---------------------------------------------------------
+# SIMPLIFIED RETRY PROMPT (Option B)
+# ---------------------------------------------------------
+
+RETRY_PROMPT_B = r"""
+Return ONLY valid JSON following this schema:
+
+{
+  "category": "",
+  "document_type": "",
+  "issuer": "",
+  "summary": "",
+  "reasoning": "",
+  "dates": {},
+  "amounts": {},
+  "numbers": {},
+  "tables": []
+}
+
+TEXT:
+{TEXT}
+"""
+
+
+# ---------------------------------------------------------
+# GEMINI RETRY CALL (NEW)
+# ---------------------------------------------------------
+
+def _call_gemini_retry_prompt(text: str, filename: str) -> Optional[str]:
+    """Call Gemini using the simplified retry prompt."""
+    if GEMINI_CLIENT is None:
+        return None
+
+    try:
+        prompt = RETRY_PROMPT_B.replace("{TEXT}", text)
+
+        contents = [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": prompt},
+                ],
+            }
+        ]
+
+        resp = GEMINI_CLIENT.models.generate_content(
+            model=GEMINI_MODEL_FALLBACK,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=4096,
+                temperature=0.1,
+            ),
+        )
+
+        raw = ""
+        if hasattr(resp, "text") and resp.text:
+            raw = resp.text
+
+        if not raw:
+            for cand in getattr(resp, "candidates", []):
+                if not cand.content:
+                    continue
+                for part in cand.content.parts:
+                    if hasattr(part, "text") and part.text:
+                        raw += part.text + "\n"
+
+        if not raw:
+            raw = str(resp)
+
+        log_fn(f"[AI] Retry prompt raw length: {len(raw)} chars", "diag")
+        return raw
+
+    except Exception as e:
+        log_fn(f"[AI] Retry prompt failed: {e}", "error")
+        return None
+
+# ---------------------------------------------------------
+# JSON REPAIR / NORMALIZER (required)
+# ---------------------------------------------------------
+import ast
+import html
+from typing import Callable
+
+def repair_json_string(raw: str, log_fn_ref: Callable = log_fn) -> str:
+    """
+    Attempt to repair common malformed JSON-like model outputs into valid JSON text.
+    Strategies:
+      - Unescape HTML entities
+      - Extract the first {...} or [...] block if present
+      - Balance braces/brackets by trimming trailing garbage
+      - Replace single quotes with double quotes when safe
+      - Remove trailing commas
+      - Remove leading non-JSON text (e.g., "Here's the result:")
+      - Attempt ast.literal_eval as a last resort and re-dump to JSON
+    Returns a string that is the best-effort repaired JSON (may still be invalid).
+    """
+    if not raw or not isinstance(raw, str):
+        return ""
+
+    s = raw.strip()
+
+    # 1) Unescape HTML entities (models sometimes return &quot; etc.)
+    try:
+        s = html.unescape(s)
+    except Exception:
+        pass
+
+    # 2) If the response contains a JSON block, try to extract the first {...} or [...]
+    first_obj = None
+    brace_stack = []
+    start_idx = None
+    for i, ch in enumerate(s):
+        if ch in "{[":
+            if start_idx is None:
+                start_idx = i
+            brace_stack.append(ch)
+        elif ch in "}]":
+            if brace_stack:
+                last = brace_stack[-1]
+                if (last == "{" and ch == "}") or (last == "[" and ch == "]"):
+                    brace_stack.pop()
+                    if not brace_stack and start_idx is not None:
+                        first_obj = s[start_idx:i+1]
+                        break
+                else:
+                    # mismatched, try to continue
+                    brace_stack.pop()
+    if first_obj:
+        s = first_obj
+
+    # 3) Remove common leading labels like "Result:", "Output:", "Answer:"
+    s = re.sub(r'^[\s\S]{0,200}?(Result|Output|Answer|JSON|Response)\s*[:\-]\s*', '', s, flags=re.IGNORECASE)
+
+    # 4) Replace smart quotes and backticks
+    s = s.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'").replace("`", "'")
+
+    # 5) If it looks like Python dict with single quotes, try ast.literal_eval
+    try:
+        if s.startswith("{") and "'" in s and '"' not in s:
+            try:
+                obj = ast.literal_eval(s)
+                repaired = json.dumps(obj, ensure_ascii=False)
+                return repaired
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 6) Replace single quotes with double quotes when it seems safe:
+    #    Only do this when there are more single quotes than double quotes and no obvious nested quotes
+    try:
+        single_count = s.count("'")
+        double_count = s.count('"')
+        if single_count and single_count > double_count:
+            # naive replacement but avoid replacing apostrophes inside words by using regex for keys/values
+            # Replace patterns like 'key': 'value' -> "key": "value"
+            s = re.sub(r"'\s*:\s*'", '": "', s)
+            s = re.sub(r"'\s*:\s*", '": ', s)
+            s = re.sub(r"\s*:\s*'", ': "', s)
+            # wrap remaining single-quoted keys/values
+            s = re.sub(r"'([^']*?)'", r'"\1"', s)
+    except Exception:
+        pass
+
+    # 7) Remove trailing commas before } or ]
+    s = re.sub(r",\s*(\}|])", r"\1", s)
+
+    # 8) Remove control characters that break JSON
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", " ", s)
+
+    # 9) Trim non-JSON prefix/suffix again if still noisy
+    # Keep only from first { or [ to last } or ]
+    first_brace = min([idx for idx in (s.find("{"), s.find("[")) if idx != -1] or [None])
+    last_brace = max(s.rfind("}"), s.rfind("]"))
+    if first_brace is not None and last_brace != -1 and last_brace > first_brace:
+        s = s[first_brace:last_brace+1]
+
+    # 10) Final cleanup: collapse multiple newlines and trim
+    s = re.sub(r"\n{2,}", "\n", s).strip()
+
+    # 11) As a last resort, try ast.literal_eval on the cleaned string
+    try:
+        obj = ast.literal_eval(s)
+        repaired = json.dumps(obj, ensure_ascii=False)
+        return repaired
+    except Exception:
+        pass
+
+    # Return the best-effort string (may still be invalid JSON)
+    return s
+
+# ---------------------------------------------------------
+# UNIFIED JSON CLEANING + PARSING (NEW)
+# ---------------------------------------------------------
+
+def clean_and_parse_json(raw: str) -> Optional[Dict[str, Any]]:
+    """Repair JSON → parse → fallback regex → return dict or None."""
+    if not raw or not isinstance(raw, str):
+        return None
+
+    repaired = repair_json_string(raw, log_fn_ref=log_fn)
+
+    try:
+        parsed = json.loads(repaired)
+        return parsed
+    except Exception as e:
+        log_fn(f"[AI] JSON parse failed after repair: {e}", "error")
+        debug_log_failed_json(repaired, log_fn_ref=log_fn)
+
+        # Regex fallback
+        fallback = fallback_parse_json_like(repaired)
+        if fallback:
+            log_fn("[AI] Using regex fallback parser.", "warn")
+            return fallback
+
+        return None
+
+# ============================================================
+# GEMINI CALL HELPERS — FULL PRODUCTION BLOCK (Smart Sorter V5.x)
+# ============================================================
+
+import json
+import time
+from google import genai
+from google.genai import types as genai_types
+
+# ------------------------------------------------------------
+# Initialize Gemini client (already done in your startup code)
+# ------------------------------------------------------------
+# client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+# ------------------------------------------------------------
+# Utility: Safe JSON repair
+# ------------------------------------------------------------
+def _repair_json(text):
+    """
+    Attempts to repair malformed JSON returned by Gemini.
+    """
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # Remove trailing commas, fix quotes, etc.
+    cleaned = text.replace("\n", " ").replace("\r", " ")
+    cleaned = cleaned.replace(",}", "}").replace(",]", "]")
+
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return {"error": "Failed to parse JSON", "raw": text}
+
+
+# ------------------------------------------------------------
+# Core Gemini call
+# ------------------------------------------------------------
+def _call_gemini_model(model_name, text, filename, max_output_tokens=8192, debug=False):
+    """
+    Calls Gemini with your enterprise prompt and returns parsed JSON.
+    """
+    from utils import log_info, log_diag, log_warn, log_error
+
+    log_diag(f"[AI] _call_gemini_model() using model={model_name}")
+
+    # Build prompt
+    prompt = f"""
+You are Smart Sorter V5.2 AI. Analyze the following document text and return a JSON object with:
+- category
+- confidence
+- metadata
+- tables (if any)
+- filename
+- summary (3–6 sentences)
+- reasoning (brief)
+
+Document filename: {filename}
+
+Document text:
+{text}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=max_output_tokens,
+                temperature=0.2,
+                top_p=0.9,
+                top_k=40,
+                response_mime_type="application/json"
+            )
+        )
+
+        raw = response.text
+        if debug:
+            log_diag(f"[AI] Raw Gemini output: {raw[:500]}...")
+
+        parsed = _repair_json(raw)
+        return parsed
+
+    except Exception as e:
+        log_error(f"[AI] Gemini call failed: {e}")
+        return {"error": str(e), "raw": None}
+
+
+# ------------------------------------------------------------
+# Fallback Gemini call (Flash or Flash-Lite)
+# ------------------------------------------------------------
+def _call_gemini_fallback(text, filename, debug=False):
+    """
+    Uses a smaller Gemini model as fallback.
+    """
+    from logger import log_diag, log_warn
+
+    fallback_model = "gemini-2.5-flash"
+    log_warn(f"[AI] Primary Gemini failed — using fallback model {fallback_model}")
+
+    return _call_gemini_model(
+        fallback_model,
+        text,
+        filename,
+        max_output_tokens=4096,
+        debug=debug
+    )
+
+
+# ------------------------------------------------------------
+# High-level wrapper used by retry pipeline
+# ------------------------------------------------------------
+def analyze_with_gemini(text, filename, debug=False):
+    """
+    High-level Gemini analysis wrapper.
+    Called by retry pipeline.
+    """
+    from utils import log_diag, log_warn
+
+    log_diag("[AI] analyze_with_gemini() invoked")
+
+    # Primary model
+    primary_model = "gemini-2.5-pro"
+
+    result = _call_gemini_model(primary_model, text, filename, debug=debug)
+
+    # If primary fails, fallback
+    if "error" in result or result is None:
+        log_warn("[AI] Primary Gemini returned error — invoking fallback")
+        result = _call_gemini_fallback(text, filename, debug=debug)
+
+    return result
+
+
+# ---------------------------------------------------------
+# FULL RETRY PIPELINE (CORRECTED & STABLE)
+# ---------------------------------------------------------
+
+def run_full_retry_pipeline(text: str, filename: str) -> Optional[Dict[str, Any]]:
+    """
+    Always runs:
+    1) Gemini Pro
+    2) Gemini Flash
+    3) Gemini Retry Prompt B
+    4) Regex fallback (inside clean_and_parse_json)
+    """
+    # -----------------------------------------------------
+    # 1) Gemini Pro
+    # -----------------------------------------------------
+    log_fn("[AI] Retry Pipeline: Gemini Pro", "diag")
+    raw1 = _call_gemini_model(GEMINI_MODEL_PRIMARY, text, filename)
+
+    parsed1 = None
+    if raw1:
+        parsed1 = clean_and_parse_json(
+            raw1 if isinstance(raw1, str) else json.dumps(raw1)
+        )
+
+    if parsed1:
+        parsed1["source_model"] = GEMINI_MODEL_PRIMARY
+        return parsed1
+
+    # -----------------------------------------------------
+    # 2) Gemini Flash
+    # -----------------------------------------------------
+    log_fn("[AI] Retry Pipeline: Gemini Flash", "diag")
+    raw2 = _call_gemini_model(GEMINI_MODEL_FALLBACK, text, filename)
+
+    parsed2 = None
+    if raw2:
+        parsed2 = clean_and_parse_json(
+            raw2 if isinstance(raw2, str) else json.dumps(raw2)
+        )
+
+    if parsed2:
+        parsed2["source_model"] = "Gemini Flash"
+        return parsed2
+
+    # -----------------------------------------------------
+    # 3) Retry Prompt B
+    # -----------------------------------------------------
+    log_fn("[AI] Retry Pipeline: Retry Prompt B", "diag")
+
+    raw3 = None
+    if "_call_gemini_retry_prompt" in globals():
+        raw3 = _call_gemini_retry_prompt(text, filename)
+
+    parsed3 = None
+    if raw3:
+        parsed3 = clean_and_parse_json(
+            raw3 if isinstance(raw3, str) else json.dumps(raw3)
+        )
+
+    if parsed3:
+        parsed3["source_model"] = "Gemini Retry"
+        return parsed3
+
+    # -----------------------------------------------------
+    # 4) Regex fallback (already inside clean_and_parse_json)
+    # -----------------------------------------------------
+    log_fn("[AI] Retry Pipeline: No valid JSON from Gemini.", "warn")
+    return None
+
+# =========================================================
+# Section C — AI ENGINE (Gemini → Flash → Retry → Qwen)
+# =========================================================
+
+import json
+
+# ---------------------------------------------------------
+# GEMINI CLIENT SETUP
+# ---------------------------------------------------------
+
+def _init_gemini_client() -> Optional[Any]:
+    """Initialize Gemini client if enabled and available."""
+    gem_cfg = AI_CFG.get("gemini", {})
+    if not gem_cfg.get("enabled", False):
+        log_fn("[AI] Gemini disabled in config.", "diag")
+        return None
+
+    if genai is None:
+        log_fn("[AI] google-genai package not installed; Gemini unavailable.", "warn")
+        return None
+
+    api_key = gem_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY")
+    if not api_key or api_key.startswith("${"):
+        log_fn("[AI] Gemini API key not set; skipping Gemini.", "warn")
+        return None
+
+    try:
+        client = genai.Client(api_key=api_key)
+        log_fn("[AI] Gemini client initialized.", "diag")
+        return client
+    except Exception as e:
+        log_fn(f"[AI] Failed to initialize Gemini client: {e}", "error")
+        return None
+
+
+GEMINI_CLIENT = _init_gemini_client()
+GEMINI_MODEL_PRIMARY = AI_CFG.get("gemini", {}).get("model", "gemini-2.5-pro")
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
+
+# NOTE: You said “keep my Gemini enterprise prompt EXACTLY as-is”.
+# Paste your existing prompt into this constant:
+GEMINI_ENTERPRISE_PROMPT = r"""
+You are an enterprise‑grade document intelligence engine.  
+Your job is to analyze OCR text and return a STRICT JSON object following the schema below.  
+You MUST follow all rules exactly.  
+You MUST NOT add commentary, explanations, or text outside the JSON.  
+You MUST NOT include markdown.  
+You MUST NOT include trailing commas.  
+You MUST NOT hallucinate fields not present in the document.  
+
+============================================================
+RULES — GENERAL
+============================================================
+
+1. Extract ONLY what is present in the document.  
+2. If a field is missing, return an empty string "" (never null).  
+3. Normalize all dates to ISO format: YYYY-MM-DD.  
+4. Normalize all amounts to plain numbers without currency symbols.  
+5. Detect the document category using the strongest signals available.  
+6. If category is uncertain, return "review".  
+7. Summaries MUST be 3–6 sentences, human-readable, and factual.  
+8. Reasoning MUST be 1–3 sentences explaining how you determined category + metadata.  
+9. DO NOT include the filename in the summary.  
+10. DO NOT include commentary outside the JSON.  
+
+============================================================
+RULES — CATEGORY DETECTION
+============================================================
+
+Use these signals to determine category:
+
+INSURANCE  
+- Mentions of policy number, claim number, coverage, deductible, premium, carrier names  
+- Words: "insurance", "policy", "claim", "coverage", "premium", "benefits"  
+
+FINANCIAL  
+- Bank names, account numbers, routing numbers, statements, balances  
+- Words: "statement", "deposit", "withdrawal", "transaction", "account"  
+
+MEDICAL  
+- Providers, CPT/ICD codes, patient info, visit summaries, EOBs  
+- Words: "patient", "provider", "diagnosis", "treatment", "EOB"  
+
+BILLING  
+- Amount due, due date, invoice number, service period  
+- Words: "invoice", "amount due", "billing", "statement", "due"  
+
+GOVERNMENT  
+- IRS, SSA, DMV, USCIS, state agencies, official forms  
+- Words: "official", "form", "department", "agency", "federal", "state"  
+
+LEGAL  
+- Contracts, agreements, signatures, clauses, legal entities  
+- Words: "agreement", "contract", "hereby", "party", "attorney"  
+
+TAX  
+- W‑2, 1099, 1040, IRS notices  
+- Words: "tax", "IRS", "income", "withholding"  
+
+RECEIPT  
+- Itemized purchases, totals, merchant info  
+- Words: "receipt", "subtotal", "sales tax", "POS"  
+
+ID  
+- Driver’s license, passport, ID card  
+- Words: "license", "DOB", "ID", "passport"  
+
+If none match confidently → category = "review".
+
+============================================================
+RULES — METADATA EXTRACTION
+============================================================
+
+issuer  
+- Company, agency, provider, or sender  
+- Prefer header text, logos, or top-left identifiers  
+
+document_type  
+- "invoice", "bill", "statement", "policy", "claim", "form", "notice", etc.  
+
+dates  
+- invoice_date  
+- due_date  
+- service_date  
+- statement_date  
+- issue_date  
+- received_date  
+Return "" if not present.
+
+amounts  
+- amount_due  
+- total  
+- subtotal  
+- tax  
+- balance  
+Return numbers only (e.g., "129.55").
+
+numbers  
+- invoice_number  
+- account_number  
+- policy_number  
+- claim_number  
+- reference_number  
+
+tables  
+- Extract any tabular data (line items, charges, transactions).  
+- Return as an array of objects.  
+- If none exist, return [].
+
+============================================================
+OUTPUT FORMAT — STRICT JSON ONLY
+============================================================
+
+{
+  "source_model": "",
+  "category": "",
+  "document_type": "",
+  "issuer": "",
+  "summary": "",
+  "reasoning": "",
+  "dates": {
+    "invoice_date": "",
+    "due_date": "",
+    "service_date": "",
+    "statement_date": "",
+    "issue_date": "",
+    "received_date": ""
+  },
+  "amounts": {
+    "amount_due": "",
+    "total": "",
+    "subtotal": "",
+    "tax": "",
+    "balance": ""
+  },
+  "numbers": {
+    "invoice_number": "",
+    "account_number": "",
+    "policy_number": "",
+    "claim_number": "",
+    "reference_number": ""
+  },
+  "tables": []
+}
+
+============================================================
+END OF INSTRUCTIONS — RETURN ONLY THE JSON OBJECT
+============================================================
+"""
+
+# ---------------------------------------------------------
+# QWEN / OLLAMA CALL HELPERS (ORIGINAL, PRESERVED)
+# ---------------------------------------------------------
+
+QWEN_PROMPT_TEMPLATE = r"""<YOUR ORIGINAL QWEN PROMPT — unchanged>"""
+
+def analyze_with_qwen(text: str, filename: str) -> Optional[Dict[str, Any]]:
+    """Try Qwen models in priority order via Ollama."""
+    models = _get_qwen_model_priority_list()
+    for m in models:
+        log_fn(f"[AI] Trying Qwen model: {m}", "diag")
+        prompt = QWEN_PROMPT_TEMPLATE.format(filename=filename, text=text)
+        raw = _call_ollama_generate(m, prompt)
+        if not raw:
+            continue
+
+        parsed = clean_and_parse_json(raw)
+        if parsed:
+            parsed["source_model"] = "Qwen (Ollama)"
+            return parsed
+
+    return None
+
+
+# ---------------------------------------------------------
+# AUGMENTED GEMINI ENGINE (Pro → Flash → Retry Prompt B)
+# ---------------------------------------------------------
+
+def analyze_with_gemini_augmented(text: str, filename: str) -> Optional[Dict[str, Any]]:
+    """
+    Always runs:
+    1) Gemini Pro
+    2) Gemini Flash
+    3) Retry Prompt B
+    4) Regex fallback (inside clean_and_parse_json)
+    """
+    return run_full_retry_pipeline(text, filename)
+
+# ---------------------------------------------------------
+# NORMALIZE AI RESULT (required)
+# ---------------------------------------------------------
+
+def normalize_ai_result(raw: Dict[str, Any], original_text: str = "", source_model_label: str = "") -> Dict[str, Any]:
+    """
+    Normalize a parsed AI output (raw) into the unified schema expected by routing/filename code.
+    - Accepts many common key names and synonyms.
+    - Ensures all expected keys exist with safe defaults.
+    - Preserves raw metadata under metadata.raw.
+    """
+    if not isinstance(raw, dict):
+        raw = {}
+
+    def _first_of(*keys):
+        for k in keys:
+            v = raw.get(k)
+            if v is not None and v != "":
+                return v
+        return ""
+
+    def _as_list(val):
+        if val is None:
+            return []
+        if isinstance(val, list):
+            return val
+        return [val]
+
+    # Map common fields and synonyms
+    category = _first_of("category", "cat", "classification", "document_category")
+    document_type = _first_of("document_type", "doc_type", "doctype", "type")
+    issuer = _first_of("issuer", "vendor", "payee", "from", "company", "organization", "org")
+    summary = _first_of("summary", "abstract", "desc", "description")
+    reasoning = _first_of("reasoning", "explanation", "why", "notes")
+    filename = _first_of("filename", "suggested_filename", "name")
+    confidence = raw.get("confidence", raw.get("score", raw.get("confidence_score", 0.0)))
+    try:
+        confidence = float(confidence) if confidence not in (None, "") else 0.0
+    except Exception:
+        confidence = 0.0
+
+    # Dates, amounts, numbers, tables, entities
+    dates = raw.get("dates", []) or []
+    if isinstance(dates, dict):
+        # sometimes dates come as {"statement_date": "..."}
+        dates = list(dates.values())
+    dates = _as_list(dates)
+
+    amounts = raw.get("amounts", {}) or {}
+    numbers = raw.get("numbers", {}) or {}
+    tables = raw.get("tables", []) or []
+
+    # Common document-specific fields
+    statement_date = _first_of("statement_date", "date", "statementDate", "billing_date", "invoice_date", "due_date")
+    due_date = _first_of("due_date", "dueDate", "payment_due", "payment_due_date")
+    billing_period = _first_of("billing_period", "service_period", "period")
+    service_period = _first_of("service_period", "servicePeriod")
+    account_number = _first_of("account_number", "acct", "acct_number", "account")
+    policy_number = _first_of("policy_number", "policy")
+    invoice_number = _first_of("invoice_number", "invoice")
+    tax_id = _first_of("tax_id", "taxid", "tax_number", "ein")
+    address = _first_of("address", "addr", "billing_address")
+    phone_numbers = raw.get("phone_numbers", raw.get("phones", [])) or []
+    if isinstance(phone_numbers, str):
+        phone_numbers = [phone_numbers]
+
+    amount_due = _first_of("amount_due", "balance_due", "due_amount", "amount")
+    new_balance = _first_of("new_balance", "balance", "current_balance")
+
+    line_items = raw.get("line_items", raw.get("items", [])) or []
+    metadata = raw.get("metadata", {}) or {}
+
+    entities = raw.get("entities", {}) or {}
+    # Ensure entity categories exist
+    entities_out = {
+        "person": _as_list(entities.get("person") or entities.get("people") or []),
+        "org": _as_list(entities.get("org") or entities.get("organization") or []),
+        "address": _as_list(entities.get("address") or []),
+        "phone": _as_list(entities.get("phone") or []),
+        "email": _as_list(entities.get("email") or []),
+    }
+
+    # Build normalized result
+    normalized: Dict[str, Any] = {
+        "text": original_text or raw.get("text", "") or "",
+        "category": category or "",
+        "confidence": confidence,
+        "summary": summary or "",
+        "reasoning": reasoning or "",
+        "filename": filename or "",
+        "source_model": source_model_label or raw.get("source_model", ""),
+        "issuer": issuer or "",
+        "document_type": document_type or "",
+        "statement_date": statement_date or "",
+        "billing_period": billing_period or "",
+        "service_period": service_period or "",
+        "due_date": due_date or "",
+        "account_number": account_number or "",
+        "policy_number": policy_number or "",
+        "invoice_number": invoice_number or "",
+        "tax_id": tax_id or "",
+        "address": address or "",
+        "phone_numbers": phone_numbers,
+        "amount_due": amount_due or "",
+        "new_balance": new_balance or "",
+        "line_items": line_items,
+        "metadata": metadata,
+        "tables": tables,
+        "entities": entities_out,
+        "dates": dates,
+        "amounts": amounts,
+        "numbers": numbers,
+        "ai_failed": False,
+    }
+
+    # Preserve raw payload for debugging
+    try:
+        normalized.setdefault("metadata", {})
+        normalized["metadata"]["raw"] = raw
+    except Exception:
+        pass
+
+    return normalized
+
+
+# ---------------------------------------------------------
+# MASTER AI ENTRYPOINT (AUGMENTED)
+# ---------------------------------------------------------
+
+def analyze_document_with_ai(text: str, filename: str) -> Dict[str, Any]:
+    """
+    Master AI entrypoint:
+    1) Gemini Pro → Flash → Retry Prompt B (always)
+    2) If still invalid → Qwen
+    3) Normalize into unified schema
+    """
+    # Default empty result
+    base_result: Dict[str, Any] = {
+        "text": text or "",
+        "category": "",
+        "confidence": 0.0,
+        "summary": "",
+        "reasoning": "",
+        "filename": filename or "",
+        "source_model": "",
+        "issuer": "",
+        "document_type": "",
+        "statement_date": "",
+        "billing_period": "",
+        "service_period": "",
+        "due_date": "",
+        "account_number": "",
+        "policy_number": "",
+        "invoice_number": "",
+        "tax_id": "",
+        "address": "",
+        "phone_numbers": [],
+        "amount_due": "",
+        "new_balance": "",
+        "line_items": [],
+        "metadata": {},
+        "tables": [],
+        "entities": {
+            "person": [],
+            "org": [],
+            "address": [],
+            "phone": [],
+            "email": [],
+        },
+        "dates": [],
+        "ai_failed": True,
+    }
+
+    # 1) Gemini (augmented)
+    gem_data = analyze_with_gemini_augmented(text, filename)
+    if gem_data:
+        log_fn("[AI] Using Gemini result.", "info")
+        normalized = normalize_ai_result(
+            gem_data,
+            original_text=text,
+            source_model_label=gem_data.get("source_model", "Gemini"),
+        )
+        normalized["ai_failed"] = False
+        return normalized
+
+    # 2) Qwen fallback
+    qwen_data = analyze_with_qwen(text, filename)
+    if qwen_data:
+        log_fn("[AI] Using Qwen result.", "info")
+        normalized = normalize_ai_result(
+            qwen_data,
+            original_text=text,
+            source_model_label=qwen_data.get("source_model", "Qwen (Ollama)"),
+        )
+        normalized["ai_failed"] = False
+        return normalized
+
+    # 3) Total failure
+    log_fn("[AI] All AI models failed; returning fallback structure.", "error")
+    return base_result
+
+# =========================================================
+# Section D — OCR PIPELINE (Google Vision + Fallbacks)
+# =========================================================
+
+import io
+
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    convert_from_path = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+
+# ---------------------------------------------------------
+# GOOGLE VISION CLIENT SETUP
+# ---------------------------------------------------------
+
+def _init_vision_client():
+    """Initialize Google Vision client if available and enabled."""
+    use_vision = AI_CFG.get("use_google_vision", True)
+    if not use_vision:
+        log_fn("[OCR] Google Vision disabled in config.", "diag")
+        return None
+
+    try:
+        from google.cloud import vision  # type: ignore
+    except ImportError:
+        log_fn("[OCR] google-cloud-vision not installed; Vision OCR unavailable.", "warn")
+        return None
+
+    try:
+        client = vision.ImageAnnotatorClient()
+        log_fn("[OCR] Google Vision client initialized.", "diag")
+        return client
+    except Exception as e:
+        log_fn(f"[OCR] Failed to initialize Google Vision client: {e}", "error")
+        return None
+
+
+VISION_CLIENT = _init_vision_client()
+
+
+# ---------------------------------------------------------
+# PDF → IMAGE CONVERSION
+# ---------------------------------------------------------
+
+def pdf_to_images(path: Path, dpi: int = 400) -> List[Image.Image]:
+    """Convert a PDF to a list of PIL Images for OCR."""
+    if convert_from_path is None or Image is None:
+        log_fn("[OCR] pdf2image or Pillow not installed; cannot OCR PDFs.", "warn")
+        return []
+
+    try:
+        images = convert_from_path(str(path), dpi=dpi)
+        log_fn(f"[OCR] Converted PDF to {len(images)} image(s) at {dpi} DPI.", "diag")
+        return images
+    except Exception as e:
+        log_fn(f"[OCR] Failed to convert PDF to images: {e}", "error")
+        return []
+
+
+def image_file_to_pil(path: Path) -> Optional[Image.Image]:
+    """Load an image file into a PIL Image."""
+    if Image is None:
+        log_fn("[OCR] Pillow not installed; cannot load images.", "warn")
+        return None
+
+    try:
+        img = Image.open(str(path))
+        return img
+    except Exception as e:
+        log_fn(f"[OCR] Failed to open image {path}: {e}", "error")
+        return None
+
+
+# ---------------------------------------------------------
+# GOOGLE VISION OCR HELPERS
+# ---------------------------------------------------------
+
+def _vision_ocr_bytes(image_bytes: bytes) -> str:
+    """Run Google Vision OCR on raw image bytes."""
+    if VISION_CLIENT is None:
+        return ""
+
+    try:
+        from google.cloud import vision  # type: ignore
+    except ImportError:
+        return ""
+
+    try:
+        image = vision.Image(content=image_bytes)
+        response = VISION_CLIENT.document_text_detection(image=image)
+        if response.error.message:
+            log_fn(f"[OCR] Vision error: {response.error.message}", "error")
+            return ""
+
+        text = response.full_text_annotation.text or ""
+        return text
+    except Exception as e:
+        log_fn(f"[OCR] Vision OCR failed: {e}", "error")
+        return ""
+
+
+def ocr_pil_image(img: Image.Image) -> str:
+    """Run OCR on a PIL Image using Google Vision."""
+    if img is None:
+        return ""
+
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+    except Exception as e:
+        log_fn(f"[OCR] Failed to convert PIL image to bytes: {e}", "error")
+        return ""
+
+    text = _vision_ocr_bytes(image_bytes)
+    return text or ""
+
+
+def ocr_pdf_with_vision(path: Path) -> str:
+    """OCR a PDF using Vision (via PDF→image)."""
+    pages = pdf_to_images(path, dpi=400)
+    if not pages:
+        return ""
+
+    all_text_parts: List[str] = []
+    for idx, page in enumerate(pages, start=1):
+        log_fn(f"[OCR] OCRing PDF page {idx}/{len(pages)}", "diag")
+        page_text = ocr_pil_image(page)
+        if page_text:
+            all_text_parts.append(page_text)
+
+    return "\n\n".join(all_text_parts).strip()
+
+
+def ocr_image_with_vision(path: Path) -> str:
+    """OCR an image file using Vision."""
+    img = image_file_to_pil(path)
+    if img is None:
+        return ""
+    return ocr_pil_image(img)
+
+
+# ---------------------------------------------------------
+# FALLBACK OCR (PLACEHOLDER)
+# ---------------------------------------------------------
+
+def fallback_ocr(path: Path) -> str:
+    """
+    Fallback OCR / text extraction.
+    Currently a placeholder — returns empty string.
+    """
+    log_fn(f"[OCR] Fallback OCR not implemented for {path.name}.", "warn")
+    return ""
+
+
+# ---------------------------------------------------------
+# MASTER OCR ENTRYPOINT (DOCX + XLSX + PDF + IMAGE)
+# ---------------------------------------------------------
+
+def extract_text_for_ai(path: Path) -> str:
+    """
+    Extract text from a file for AI analysis.
+
+    Strategy:
+    - DOCX → python-docx
+    - XLSX → openpyxl
+    - PDF → Vision OCR → fallback
+    - Image → Vision OCR → fallback
+    - TXT/MD → read as text
+    - Others → empty text
+    """
+    suffix = path.suffix.lower()
+
+    log_fn("[DEBUG] Running extract_text_for_ai()", "diag")
+    log_fn(f"[DEBUG] suffix detected = '{suffix}' for {path.name}", "diag")
+
+    # DOCX
+    if suffix == ".docx":
+        log_fn(f"[DOCX] Extracting text from DOCX: {path.name}", "info")
+        try:
+            from docx import Document
+            doc = Document(path)
+            text = "\n".join([p.text for p in doc.paragraphs])
+            if text.strip():
+                log_fn(f"[DOCX] Extracted {len(text)} characters from {path.name}", "diag")
+                return text
+            else:
+                log_fn(f"[DOCX] No text found in {path.name}", "warn")
+                return ""
+        except Exception as e:
+            log_fn(f"[DOCX] Failed to extract DOCX ({e}); returning empty text.", "error")
+            return ""
+
+    # XLSX
+    if suffix == ".xlsx":
+        log_fn(f"[XLSX] Extracting text from XLSX: {path.name}", "info")
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(path, data_only=True)
+            rows_out = []
+
+            for sheet in wb.worksheets:
+                rows_out.append(f"=== SHEET: {sheet.title} ===")
+                for row in sheet.iter_rows(values_only=True):
+                    if not row:
+                        continue
+                    cleaned = [str(c) for c in row if c not in (None, "")]
+                    if cleaned:
+                        rows_out.append(" | ".join(cleaned))
+
+            text = "\n".join(rows_out)
+            if text.strip():
+                log_fn(f"[XLSX] Extracted {len(text)} characters from {path.name}", "diag")
+                return text
+            else:
+                log_fn(f"[XLSX] No text found in {path.name}", "warn")
+                return ""
+        except Exception as e:
+            log_fn(f"[XLSX] Failed to extract XLSX ({e}); returning empty text.", "error")
+            return ""
+
+    # PDF
+    if suffix == ".pdf":
+        log_fn(f"[OCR] Extracting text from PDF: {path.name}", "info")
+        if VISION_CLIENT is not None:
+            text = ocr_pdf_with_vision(path)
+            if text.strip():
+                return text
+        return fallback_ocr(path)
+
+    # Image
+    photo_exts = CLASSIFICATION_CFG.get("photo_extensions", [])
+    if suffix in [e.lower() for e in photo_exts]:
+        log_fn(f"[OCR] Extracting text from image: {path.name}", "info")
+        if VISION_CLIENT is not None:
+            text = ocr_image_with_vision(path)
+            if text.strip():
+                return text
+        return fallback_ocr(path)
+
+    # Plain text
+    doc_exts = CLASSIFICATION_CFG.get("document_extensions", [])
+    if suffix in [".txt", ".md"] or suffix in [e.lower() for e in doc_exts if e.lower() in [".txt", ".md"]]:
+        log_fn(f"[OCR] Reading plain text document: {path.name}", "info")
+        return read_file_text(path)
+
+    # Unsupported
+    log_fn(f"[OCR] No specialized extractor for {path.name}; returning empty text.", "warn")
+    return ""
+
+# =========================================================
+# Section E — FILENAME ENGINE V4 (Semantic, Metadata-Aware)
+# =========================================================
+
+import re
+from datetime import datetime
+
+# ---------------------------------------------------------
+# FILENAME SANITIZATION HELPERS
+# ---------------------------------------------------------
+
+def _sanitize_component(value: str) -> str:
+    """
+    Sanitize a single filename component:
+    - Strip whitespace
+    - Replace invalid characters with '_'
+    - Collapse multiple underscores
+    - Trim to a reasonable length
+    """
+    if not value:
+        return ""
+
+    v = value.strip()
+    v = re.sub(r'[\\/:*?"<>|]+', "_", v)   # invalid filename chars
+    v = re.sub(r"\s+", "_", v)            # spaces → underscores
+    v = re.sub(r"_+", "_", v)             # collapse multiple underscores
+    v = v.strip("_")
+    if len(v) > 60:
+        v = v[:60]
+    return v
+
+
+def _normalize_date_for_filename(date_str: str) -> str:
+    """
+    Normalize a date string into YYYYMMDD for filenames.
+    If parsing fails, return empty string.
+    """
+    if not date_str:
+        return ""
+
+    candidates = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m",
+        "%Y/%m",
+    ]
+
+    for fmt in candidates:
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            return dt.strftime("%Y%m%d")
+        except Exception:
+            continue
+
+    # Loose pattern
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", date_str)
+    if m:
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            dt = datetime(y, mo, d)
+            return dt.strftime("%Y%m%d")
+        except Exception:
+            pass
+
+    return ""
+
+
+def _pick_best_date_for_filename(ai_result: Dict[str, Any]) -> str:
+    """
+    Choose the best date field for filename:
+    1) statement_date
+    2) due_date
+    3) billing_period
+    4) service_period
+    5) first entry in dates[]
+    """
+    for key in ["statement_date", "due_date", "billing_period", "service_period"]:
+        val = str(ai_result.get(key, "") or "")
+        norm = _normalize_date_for_filename(val)
+        if norm:
+            return norm
+
+    dates = ai_result.get("dates", [])
+    if isinstance(dates, list) and dates:
+        for d in dates:
+            norm = _normalize_date_for_filename(str(d))
+            if norm:
+                return norm
+
+    return ""
+
+
+# ---------------------------------------------------------
+# FILENAME V4 BUILDER (Semantic + Metadata-Aware)
+# ---------------------------------------------------------
+
+def build_smart_filename(ai_result: Dict[str, Any], original_path: Path) -> str:
+    """
+    Build a semantic, metadata-aware filename using AI result fields.
+
+    Pattern (best effort):
+      {DATE}_{ISSUER}_{DOC_TYPE}_{CATEGORY}_{ACCOUNT_OR_POLICY}_{ORIGINAL}.{EXT}
+
+    Rules:
+    - Use normalized date if available (YYYYMMDD)
+    - Use issuer, document_type, category if present
+    - Use account_number or policy_number if present
+    - Always preserve original extension
+    - Sanitize all components
+    - Avoid empty components and double underscores
+    """
+    ext = original_path.suffix or ""
+    orig_stem = original_path.stem
+
+    issuer = _sanitize_component(str(ai_result.get("issuer", "") or ""))
+    doc_type = _sanitize_component(str(ai_result.get("document_type", "") or ""))
+    category = _sanitize_component(str(ai_result.get("category", "") or ""))
+    account = _sanitize_component(str(ai_result.get("account_number", "") or ""))
+    policy = _sanitize_component(str(ai_result.get("policy_number", "") or ""))
+
+    acct_or_policy = account or policy
+
+    # Date
+    date_part = _pick_best_date_for_filename(ai_result)
+
+    # Original stem (sanitized)
+    orig_component = _sanitize_component(orig_stem)
+    if len(orig_component) > 40:
+        orig_component = orig_component[:40]
+
+    components: List[str] = []
+    if date_part:
+        components.append(date_part)
+    if issuer:
+        components.append(issuer)
+    if doc_type:
+        components.append(doc_type)
+    if category and category.lower() not in (doc_type.lower() if doc_type else ""):
+        components.append(category)
+    if acct_or_policy:
+        components.append(acct_or_policy)
+    if orig_component:
+        components.append(orig_component)
+
+    if not components:
+        log_fn("[NAME] No metadata for filename; using original name.", "warn")
+        return original_path.name
+
+    filename_core = "_".join([c for c in components if c])
+    filename_core = re.sub(r"_+", "_", filename_core).strip("_")
+
+    if len(filename_core) > 150:
+        filename_core = filename_core[:150]
+
+    new_name = f"{filename_core}{ext}"
+    return new_name
+
+# =========================================================
+# Section F — ROUTING ENGINE (Categories → Folders)
+# With Semi‑Auto Routing Tier (Option A)
+# =========================================================
+
+from pathlib import Path
+import re
+from typing import Dict, Any, Optional
+
+SORTED_ROOT = Path(DESTINATIONS.get("sorted_root", str(OUTPUT_FOLDER)))
+
+
+def _normalize_category_key(cat: str) -> str:
+    if not cat:
+        return ""
+    c = cat.lower().strip()
+    c = re.sub(r"[^a-z0-9\s]+", " ", c)
+    c = re.sub(r"\s+", "_", c)
+    return c.strip("_")
+
+
+def _find_best_destination_for_category(category: str) -> Optional[Path]:
+    if not category:
+        return None
+    norm = _normalize_category_key(category)
+    if not norm:
+        return None
+
+    # Direct match
+    if norm in DESTINATIONS:
+        return Path(DESTINATIONS[norm])
+
+    # Partial / fuzzy match
+    for key, path_str in DESTINATIONS.items():
+        key_norm = _normalize_category_key(key)
+        if not key_norm:
+            continue
+        if norm == key_norm:
+            return Path(path_str)
+        if norm in key_norm or key_norm in norm:
+            return Path(path_str)
+
+    return None
+
+
+def _sanitize_category_folder_name(category: str) -> str:
+    if not category:
+        return "Uncategorized"
+    c = re.sub(r'[\\/:*?"<>|]+', "_", category.strip())
+    c = re.sub(r"\s+", " ", c).strip()
+    return c[:60] or "Uncategorized"
+
+
+def get_or_create_category_folder(category: str) -> Path:
+    dest = _find_best_destination_for_category(category)
+    if dest:
+        ensure_folder(dest)
+        return dest
+
+    safe_name = _sanitize_category_folder_name(category)
+    auto_folder = SORTED_ROOT / safe_name
+    ensure_folder(auto_folder)
+    log_fn(f"[ROUTE] Auto-created category folder: {auto_folder}", "info")
+    return auto_folder
+
+
+def decide_destination_folder(ai_result: Dict[str, Any], original_path: Path) -> Path:
+    """
+    Option A — Semi‑Auto Routing:
+    - If issuer exists but category missing or AI uncertain → SEMI_AUTO
+    - If category exists and AI succeeded → category folder
+    - Else → REVIEW or OTHER fallback
+    """
+    category = str(ai_result.get("category", "") or "")
+    ai_failed = bool(ai_result.get("ai_failed", False))
+
+    # Extract issuer (if present)
+    issuer = ""
+    try:
+        issuer = (
+            ai_result.get("issuer")
+            or ai_result.get("metadata", {}).get("issuer")
+            or ai_result.get("metadata", {}).get("raw", {}).get("issuer")
+            or ""
+        )
+    except Exception:
+        issuer = ai_result.get("issuer", "") or ""
+
+    # --- SEMI-AUTO LOGIC (Option A) ---
+    semi_auto_path = DESTINATIONS.get("semi_auto")
+    if issuer and semi_auto_path:
+        # If issuer exists but category missing OR AI flagged uncertain → SemiAuto
+        if not category or ai_failed:
+            folder = Path(semi_auto_path)
+            ensure_folder(folder)
+            log_fn(f"[ROUTE] Semi‑Auto: issuer present but category missing/uncertain → {folder}", "info")
+            return folder
+
+    # --- NORMAL CATEGORY ROUTING ---
+    if not ai_failed and category:
+        folder = get_or_create_category_folder(category)
+        return folder
+
+    # --- FALLBACKS ---
+    review_path = DESTINATIONS.get("review")
+    other_path = DESTINATIONS.get("other")
+
+    if review_path:
+        folder = Path(review_path)
+        ensure_folder(folder)
+        log_fn(f"[ROUTE] AI failed/uncertain; routing to REVIEW: {folder}", "warn")
+        return folder
+
+    if other_path:
+        folder = Path(other_path)
+        ensure_folder(folder)
+        log_fn(f"[ROUTE] AI failed/uncertain; routing to OTHER: {folder}", "warn")
+        return folder
+
+    ensure_folder(SORTED_ROOT)
+    log_fn(f"[ROUTE] AI failed/uncertain; routing to SORTED_ROOT: {SORTED_ROOT}", "warn")
+    return SORTED_ROOT
+
+
+def route_file_with_ai(src_path: Path, ai_result: Dict[str, Any]) -> None:
+    """
+    Apply routing + filename logic.
+    """
+    try:
+        from filename_v3_engine import _extract_issuer, build_v3_filename, dump_ai_debug
+    except Exception as e:
+        log_fn(f"[ROUTE] Failed to import filename_v3_engine: {e}", "error")
+        ensure_folder(ERROR_FOLDER)
+        safe_move(src_path, ERROR_FOLDER / src_path.name)
+        return
+
+    category = ai_result.get("category", "") or ""
+    metadata = ai_result.get("metadata", {}) or {}
+    text = ai_result.get("text", "") or ""
+    ai_failed = bool(ai_result.get("ai_failed", False))
+
+    # Extract issuer
+    try:
+        issuer = _extract_issuer(metadata, text, category, str(src_path))
+    except Exception as e:
+        log_fn(f"[ROUTE] _extract_issuer error: {e}", "warn")
+        issuer = None
+
+    # Dump debug payload if uncertain
+    if ai_failed or not issuer:
+        try:
+            dump_ai_debug(ai_result, src_path.name)
+        except Exception as e:
+            log_fn(f"[ROUTE] Failed to dump AI debug: {e}", "error")
+
+    if issuer:
+        log_fn(f"[ROUTE] Detected issuer: {issuer}", "diag")
+    else:
+        log_fn("[ROUTE] No issuer detected", "diag")
+
+    # FINANCIAL → credit_card_statement override
+    try:
+        BANK_ISSUERS_LOCAL = [
+            "capital one", "chase", "citi", "citibank", "american express",
+            "amex", "discover", "wells fargo", "us bank", "bank of america"
+        ]
+        if category.lower() == "financial" and issuer and issuer.lower() in BANK_ISSUERS_LOCAL:
+            log_fn("[ROUTE] Overriding FINANCIAL → credit_card_statement", "diag")
+            category = "credit_card_statement"
+            ai_result["category"] = "credit_card_statement"
+    except Exception:
+        pass
+
+    # Decide destination
+    dest_folder = decide_destination_folder(ai_result, src_path)
+
+    # Build filename
+    try:
+        new_name = build_v3_filename(
+            category=category,
+            metadata=metadata,
+            text=text,
+            gem_filename=ai_result.get("filename", ""),
+            reasoning=ai_result.get("reasoning", ""),
+            original_path=str(src_path),
+        )
+    except Exception as e:
+        log_fn(f"[ROUTE] build_v3_filename failed: {e}", "error")
+        new_name = src_path.name
+
+    dest_path = dest_folder / new_name
+
+    # Avoid overwrites
+    counter = 1
+    base_stem = dest_path.stem
+    ext = dest_path.suffix or src_path.suffix or ".pdf"
+
+    while dest_path.exists():
+        dest_path = dest_folder / f"{base_stem}__{counter}{ext}"
+        counter += 1
+
+    # Move file
+    try:
+        safe_move(src_path, dest_path)
+        log_fn(f"[FS] Moved: {src_path} -> {dest_path}", "info")
+    except Exception as e:
+        log_fn(f"[FS] Move failed: {e}", "error")
+        ensure_folder(ERROR_FOLDER)
+        safe_move(src_path, ERROR_FOLDER / src_path.name)
+
+# ============================================================
+# Section G — WATCHER LOOP (Continuous Real-Time Monitoring)
+# ============================================================
+
+import time
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+
+# ---------------------------------------------------------
+# SCAN A SINGLE FOLDER
+# ---------------------------------------------------------
+
+def _scan_single_folder(folder: Path) -> List[Path]:
+    """
+    Return a list of files in a folder (non-recursive).
+    Skip temporary/incomplete files.
+    """
+    if not folder.exists():
+        return []
+
+    results: List[Path] = []
+    for item in folder.iterdir():
+        if item.is_file() and not is_temp_extension(item):
+            results.append(item)
+    return results
+
+
+# ---------------------------------------------------------
+# DUPLICATE DETECTION HELPERS
+# ---------------------------------------------------------
+
+DUPLICATE_FOLDER = Path(r"C:\Users\joelk\OneDrive\Smart Inbox\Incoming\Duplicates")
+
+
+def _file_sha256(path: Path) -> str:
+    """Compute SHA-256 hash of a file in streaming mode."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _is_duplicate(path: Path) -> Tuple[bool, str]:
+    """
+    Returns (True, hash) if file is a duplicate.
+    Uses global PROCESSED_HASHES to avoid reprocessing.
+    """
+    file_hash = _file_sha256(path)
+
+    if file_hash in PROCESSED_HASHES:
+        return True, file_hash
+
+    PROCESSED_HASHES.add(file_hash)
+    return False, file_hash
+
+
+def _handle_duplicate(path: Path, file_hash: str):
+    """Moves duplicate files to the duplicate folder."""
+    DUPLICATE_FOLDER.mkdir(parents=True, exist_ok=True)
+    dest = DUPLICATE_FOLDER / path.name
+
+    log_warn(f"[DUPLICATE] Duplicate detected (hash={file_hash[:12]}...). Moving to: {dest}")
+
+    try:
+        shutil.move(path, dest)
+    except Exception as e:
+        log_error(f"[DUPLICATE] Failed to move duplicate: {e}")
+
+def _get_photo_date(path: Path) -> Tuple[str, str]:
+    """
+    Returns (year, month) from EXIF if possible, else filesystem timestamp.
+    """
+    try:
+        img = Image.open(path)
+        exif = img.getexif()
+
+        dt = exif.get(36867) or exif.get(306)  # DateTimeOriginal or DateTime
+        if dt:
+            parts = dt.split(" ")[0].split(":")
+            year, month = parts[0], parts[1]
+            return year, month
+    except Exception:
+        pass
+
+    ts = path.stat().st_mtime
+    dt = datetime.fromtimestamp(ts)
+    return str(dt.year), f"{dt.month:02d}"
+
+
+def _process_file(path: Path) -> None:
+    """
+    Full Smart Sorter V5.3 pipeline:
+    1) Wait for file stability
+    2) Duplicate detection
+    3) PHOTO BRANCH (JPG/JPEG)
+       - Gemini document-photo detection
+       - Convert to PDF if needed
+       - Otherwise run photo metadata pipeline
+    4) OCR text extraction
+    5) AI retry pipeline (Gemini Pro → Flash → Retry Prompt → Qwen)
+    6) Issuer extraction
+    7) Category auto-creation
+    8) Filename V3 builder
+    9) Move file to destination
+    """
+
+    log_info(f"[WATCH] Processing file: {path}")
+
+    # -----------------------------------------------------
+    # 1. Wait for file stability
+    # -----------------------------------------------------
+    if not is_file_stable(path):
+        log_warn(f"[WATCH] File not stable, skipping: {path}")
+        return
+
+    # -----------------------------------------------------
+    # 2. Duplicate detection
+    # -----------------------------------------------------
+    is_dup, file_hash = _is_duplicate(path)
+    if is_dup:
+        _handle_duplicate(path, file_hash)
+        return
+
+    filename = path.name
+
+    # -----------------------------------------------------
+    # 3. PHOTO BRANCH (JPG/JPEG)
+    # -----------------------------------------------------
+    if path.suffix.lower() in [".jpg", ".jpeg"]:
+
+        log_info(f"[PHOTOS] Processing photo → {path.name}")
+
+        # ---------------------------------------------------------
+        # DOCUMENT PHOTO DETECTION (Gemini) → PDF conversion
+        # ---------------------------------------------------------
+        try:
+            if is_document_photo_gemini(path):
+                log_info(f"[DOC-PHOTO] Gemini detected document photo → converting to PDF")
+
+                pdf_path = path.with_suffix(".pdf")
+
+                try:
+                    convert_image_to_clean_pdf(path, pdf_path)
+                    log_info(f"[DOC-PHOTO] PDF created: {pdf_path}")
+
+                    # Delete original JPG
+                    try:
+                        os.remove(path)
+                        log_info("[DOC-PHOTO] Removed original JPG")
+                    except Exception as e:
+                        log_warn(f"[DOC-PHOTO] Could not delete original JPG: {e}")
+
+                    # Continue pipeline using PDF
+                    path = pdf_path
+                    filename = pdf_path.name
+
+                    # Skip photo routing — treat as document
+                    raise StopIteration
+
+                except Exception as e:
+                    log_error(f"[DOC-PHOTO] Conversion failed: {e}")
+
+        except StopIteration:
+            # Jump to OCR/AI pipeline below
+            pass
+        else:
+            # ---------------------------------------------------------
+            # NOT a document → continue normal photo pipeline
+            # ---------------------------------------------------------
+
+            # 1. Hybrid duplicate detection (SHA256 + pHash)
+            is_photo_dup, reason = is_photo_duplicate(path)
+            if is_photo_dup:
+                dup_folder = Path(r"C:\Users\joelk\OneDrive\Smart Inbox\Incoming\Duplicates\Photos")
+                dup_folder.mkdir(parents=True, exist_ok=True)
+                dest = dup_folder / path.name
+                log_warn(f"[PHOTOS] Duplicate ({reason}) detected → {dest}")
+                try:
+                    shutil.move(path, dest)
+                except Exception as e:
+                    log_error(f"[PHOTOS] Failed to move duplicate photo: {e}")
+                return
+
+            # 2. Extract EXIF + base metadata
+            base_meta = extract_photo_metadata(path)
+
+            # 3. Compute hashes
+            sha256 = sha256_hash(path)
+            phash = perceptual_hash(path)
+
+            # 4. Save metadata to DB
+            try:
+                save_photo_metadata(sha256, phash, base_meta)
+                log_info(f"[META] Saved photo metadata for {path.name}")
+            except Exception as e:
+                log_error(f"[META] Failed to save metadata: {e}")
+
+            # 5. Determine year/month from EXIF
+            date_taken = base_meta.get("date_taken")
+            if date_taken:
+                try:
+                    dt = datetime.strptime(date_taken, "%Y:%m:%d %H:%M:%S")
+                    year = str(dt.year)
+                    month = f"{dt.month:02d}"
+                except Exception:
+                    year = "Unknown"
+                    month = "Unknown"
+            else:
+                year = "Unknown"
+                month = "Unknown"
+
+            # 6. Route photo AFTER metadata extraction
+            photos_root = Path(r"C:\Users\joelk\OneDrive\Smart Inbox\Incoming\Sorted\Photos")
+            dest_folder = photos_root / year / month
+            dest_folder.mkdir(parents=True, exist_ok=True)
+
+            dest = dest_folder / path.name
+            log_info(f"[PHOTOS] Routing photo → {dest}")
+
+            try:
+                shutil.move(path, dest)
+                log_info(f"[PHOTOS] Photo routed successfully → {dest}")
+            except Exception as e:
+                log_error(f"[PHOTOS] Failed to move photo: {e}")
+                ensure_folder(ERROR_FOLDER)
+                safe_move(path, ERROR_FOLDER / path.name)
+
+            return  # final return for photo paths
+
+    # -----------------------------------------------------
+    # 4. OCR → extract text for AI
+    # -----------------------------------------------------
+    log_diag("[WATCH] Extracting text for AI...")
+    ocr_text = extract_text_for_ai(path)
+
+    if not ocr_text.strip():
+        log_warn(f"[WATCH] No text extracted; AI may fail: {path}")
+
+    # -----------------------------------------------------
+    # 5. AI classification pipeline
+    # -----------------------------------------------------
+    log_diag("[WATCH] Running AI retry pipeline...")
+    ai_result = run_full_retry_pipeline(ocr_text, filename)
+
+    if not ai_result:
+        log_warn("[AI] No valid AI result — defaulting to Uncategorized")
+        category = "Uncategorized"
+    else:
+        dump_ai_debug(ai_result, filename_hint=filename)
+        category = ai_result.get("category") or "Uncategorized"
+
+    # -----------------------------------------------------
+    # 6. Issuer extraction
+    # -----------------------------------------------------
+    issuer = _extract_issuer(ai_result or {}, ocr_text)
+
+    # -----------------------------------------------------
+    # 7. Category auto-creation
+    # -----------------------------------------------------
+    sorted_root = Path(r"C:\Users\joelk\OneDrive\Smart Inbox\Incoming\Sorted")
+    category_folder = ensure_category_folder(sorted_root, category)
+
+    # -----------------------------------------------------
+    # 8. Filename V3 builder
+    # -----------------------------------------------------
+    new_filename = build_v3_filename(ai_result or {}, filename, ocr_text)
+    destination = category_folder / new_filename
+
+    log_diag(f"[ROUTE] Moving file to: {destination}")
+
+    # -----------------------------------------------------
+    # 9. Move file
+    # -----------------------------------------------------
+    try:
+        shutil.move(path, destination)
+        log_info(f"[ROUTE] File routed successfully → {destination}")
+    except Exception as e:
+        log_error(f"[ROUTE] Failed to move file: {e}")
+        ensure_folder(ERROR_FOLDER)
+        safe_move(path, ERROR_FOLDER / filename)
+
+# ---------------------------------------------------------
+# SCAN A GROUP OF FOLDERS
+# ---------------------------------------------------------
+
+def _scan_group(group_name: str, folders: List[str]) -> None:
+    """
+    Scan all folders in a group and process new files.
+    """
+    log_fn(f"[WATCH] Scanning group '{group_name}'", "diag")
+
+    for folder_str in folders:
+        folder = Path(folder_str)
+        ensure_folder(folder)
+
+        files = _scan_single_folder(folder)
+        for f in files:
+            try:
+                _process_file(f)
+            except Exception as e:
+                log_fn(f"[WATCH] Error processing {f}: {e}", "error")
+                ensure_folder(ERROR_FOLDER)
+                err_dest = ERROR_FOLDER / f.name
+                safe_move(f, err_dest)
+
+
+# ---------------------------------------------------------
+# WATCHDOG HANDLER
+# ---------------------------------------------------------
+
+class SmartSorterHandler(FileSystemEventHandler):
+    def __init__(self, group_name: str):
+        self.group_name = group_name
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+
+        path = Path(event.src_path)
+        log_fn(f"[WATCH] Detected new file in '{self.group_name}': {path}", "info")
+
+        try:
+            _process_file(path)
+        except Exception as e:
+            log_fn(f"[WATCH] Error processing {path}: {e}", "error")
+            ensure_folder(ERROR_FOLDER)
+            safe_move(path, ERROR_FOLDER / path.name)
+
+
+# ---------------------------------------------------------
+# WATCHER LOOP (EVENT-BASED)
+# ---------------------------------------------------------
+
+def watcher_loop() -> None:
+    """
+    Real-time watcher loop:
+    - Runs initial scan once
+    - Attaches watchdog observers to each folder
+    - Reacts instantly to new files
+    - No repeated scanning spam
+    """
+    log_fn("[WATCH] Starting continuous watcher loop (V5.3).", "info")
+
+    # 1. Initial scan (one-time)
+    for group in INITIAL_SCAN_GROUPS:
+        folders = OBSERVER_GROUPS.get(group, [])
+        _scan_group(group, folders)
+
+    # 2. Attach watchers
+    observers = []
+    for group_name, folders in OBSERVER_GROUPS.items():
+        for folder_str in folders:
+            folder = Path(folder_str)
+            ensure_folder(folder)
+
+            handler = SmartSorterHandler(group_name)
+            observer = Observer()
+            observer.schedule(handler, str(folder), recursive=True)
+            observer.start()
+
+            observers.append(observer)
+            log_fn(f"[WATCH] Attached watcher to: {folder}", "success")
+
+    # 3. Idle forever
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log_fn("[WATCH] Stopping watchers...", "warn")
+        for obs in observers:
+            obs.stop()
+        for obs in observers:
+            obs.join()
+
+# =========================================================
+# Section 12 — PERFORMANCE OPTIMIZATIONS (placeholder)
+# =========================================================
+
+def optimize_system() -> None:
+    """
+    Placeholder for performance optimizations.
+    You can extend this to:
+    - Preload OCR models
+    - Cache AI results
+    - Parallelize folder scans
+    - Use thread pools
+    """
+    # Currently unused — reserved for future expansion.
+    return
+
+# =========================================================
+# Section H — MAIN ENTRYPOINT
+# =========================================================
+
+if __name__ == "__main__":
+    log_fn("==============================================", "info")
+    log_fn(" Smart Sorter V5.3 — Monolithic Edition START ", "info")
+    log_fn("==============================================", "info")
+
+    # Ensure core folders exist
+    ensure_folder(INPUT_FOLDER)
+    ensure_folder(OUTPUT_FOLDER)
+    ensure_folder(ERROR_FOLDER)
+    ensure_folder(SORTED_ROOT)
+
+    # Optional performance hooks
+    optimize_system()
+
+    # Start watcher loop
+    try:
+        watcher_loop()
+    except KeyboardInterrupt:
+        log_fn("[SYSTEM] Smart Sorter stopped by user.", "warn")
+    except Exception as e:
+        log_fn(f"[SYSTEM] Fatal error: {e}", "error")

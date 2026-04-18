@@ -1,0 +1,1503 @@
+# ============================================================
+# PHOTO + DOCUMENT DASHBOARD — DARK MODE, VIEWER, MAP, PEOPLE, ALBUMS
+# Unified photos + docs, NL albums, live refresh
+# ============================================================
+
+from pathlib import Path
+import sqlite3
+import json
+import os
+import re
+from datetime import datetime
+from random import choice
+
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    render_template_string,
+    send_file,
+    redirect,
+    url_for,
+)
+from PIL import Image
+
+from photo_duplicates import DB_PATH, find_similar_faces, cluster_faces
+
+# Thumbnail roots
+THUMB_ROOT = Path("photo_thumbs")
+THUMB_ROOT.mkdir(exist_ok=True)
+
+FACE_THUMB_ROOT = Path("photo_face_thumbs")
+FACE_THUMB_ROOT.mkdir(exist_ok=True)
+
+app = Flask(__name__)
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+def _split_tags_list(tags_str):
+    if not tags_str:
+        return []
+    try:
+        data = json.loads(tags_str)
+        if isinstance(data, list):
+            return data
+        return [str(data)]
+    except Exception:
+        return [t.strip() for t in str(tags_str).split(",") if t.strip()]
+
+
+def _update_thumb_path(sha: str, thumb_path: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE photos SET thumb_path = ? WHERE sha256 = ?",
+        (thumb_path, sha),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _ensure_thumbnail(row: dict) -> str | None:
+    sha = row["sha256"]
+    orig = row["original_path"]
+    if not sha or not orig:
+        return None
+
+    thumb_path = THUMB_ROOT / f"{sha}.jpg"
+    if thumb_path.exists():
+        return str(thumb_path)
+
+    # Fallback only for real images; documents should already have thumb_path
+    try:
+        img = Image.open(orig)
+        img.thumbnail((512, 512))
+        img = img.convert("RGB")
+        img.save(thumb_path, "JPEG", quality=85)
+        _update_thumb_path(sha, str(thumb_path))
+        return str(thumb_path)
+    except Exception:
+        return None
+
+
+def _ensure_face_thumbnail(row: dict) -> str | None:
+    sha = row["sha256"]
+    orig = row["original_path"]
+    face_data = row.get("face_data")
+    if not sha or not orig or not face_data:
+        return None
+
+    face_thumb_path = FACE_THUMB_ROOT / f"{sha}_face.jpg"
+    if face_thumb_path.exists():
+        return str(face_thumb_path)
+
+    try:
+        faces = json.loads(face_data)
+        if not faces:
+            return None
+        bp = faces[0].get("bounding_poly", {}).get("vertices", [])
+        if not bp:
+            return None
+
+        xs = [v.get("x", 0) for v in bp]
+        ys = [v.get("y", 0) for v in bp]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+
+        img = Image.open(orig).convert("RGB")
+        w, h = img.size
+        left = max(0, min_x)
+        top = max(0, min_y)
+        right = min(w, max_x)
+        bottom = min(h, max_y)
+        if right <= left or bottom <= top:
+            return None
+
+        face = img.crop((left, top, right, bottom))
+        face.thumbnail((256, 256))
+        face.save(face_thumb_path, "JPEG", quality=85)
+        return str(face_thumb_path)
+    except Exception:
+        return None
+
+
+def _load_rows(limit: int = 200):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM photos ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.execute("SELECT COUNT(*) FROM photos")
+    count = cur.fetchone()[0]
+    conn.close()
+
+    for r in rows:
+        if r.get("tags"):
+            try:
+                tags = json.loads(r["tags"])
+                r["tags"] = ", ".join(tags[:5])
+            except Exception:
+                pass
+
+    return rows, count
+
+
+def _random_photo_sha() -> str | None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT sha256 FROM photos")
+    rows = [r["sha256"] for r in cur.fetchall()]
+    conn.close()
+    if not rows:
+        return None
+    return choice(rows)
+
+
+# ------------------------------------------------------------
+# Smart albums + NL search
+# ------------------------------------------------------------
+
+SMART_ALBUM_DEFS = {
+    "People": {
+        "min_faces": 1,
+        "desc": "Photos containing people",
+    },
+    "No People": {
+        "max_faces": 0,
+        "desc": "Photos without any faces",
+    },
+    "Animals": {
+        "tags_any": ["Dog", "Cat", "Animal", "Mammal", "Pet"],
+        "desc": "Pets and animals",
+    },
+    "Cars": {
+        "tags_any": ["Car", "Vehicle", "Truck", "Automobile"],
+        "desc": "Cars, trucks, and vehicles",
+    },
+    "Outdoors": {
+        "tags_any": ["Outdoor", "Nature", "Tree", "Sky", "Mountain", "Water"],
+        "desc": "Nature and outdoor scenes",
+    },
+    # This is still tag-based; documents themselves are handled via /documents
+    "Documents": {
+        "tags_any": ["Document", "Paper", "Text", "Screenshot"],
+        "desc": "Documents, screenshots, and text-like images",
+    },
+}
+
+def _album_query(defn: dict) -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    query = "SELECT * FROM photos WHERE 1=1"
+    params: list = []
+
+    if "min_faces" in defn:
+        query += " AND face_count >= ?"
+        params.append(defn["min_faces"])
+
+    if "max_faces" in defn:
+        query += " AND face_count <= ?"
+        params.append(defn["max_faces"])
+
+    if "tags_any" in defn:
+        for t in defn["tags_any"]:
+            query += " AND tags LIKE ?"
+            params.append(f"%{t}%")
+
+    cur.execute(query, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    for r in rows:
+        if r.get("tags"):
+            try:
+                tags_list = json.loads(r["tags"])
+                r["tags"] = ", ".join(tags_list[:5])
+            except Exception:
+                pass
+
+    return rows
+
+
+def parse_nl_query(q: str) -> dict:
+    q = (q or "").lower()
+    filters: dict = {}
+
+    year_match = re.search(r"(20\d{2})", q)
+    if year_match:
+        year = year_match.group(1)
+        filters["date_from"] = f"{year}-01-01"
+        filters["date_to"] = f"{year}-12-31"
+
+    if "people" in q or "person" in q or "faces" in q:
+        filters["min_faces"] = 1
+
+    if any(w in q for w in ["dog", "dogs", "pet", "pets"]):
+        filters.setdefault("tags", []).extend(["Dog", "Animal", "Mammal", "Pet"])
+
+    if any(w in q for w in ["cat", "cats"]):
+        filters.setdefault("tags", []).extend(["Cat", "Animal", "Mammal", "Pet"])
+
+    if any(w in q for w in ["car", "cars", "vehicle", "truck"]):
+        filters.setdefault("tags", []).extend(["Car", "Vehicle", "Truck", "Automobile"])
+
+    if any(w in q for w in ["sunset", "sunrise", "sky"]):
+        filters.setdefault("tags", []).extend(["Sunset", "Sky"])
+
+    if any(w in q for w in ["document", "receipt", "paper"]):
+        filters.setdefault("tags", []).extend(["Document", "Paper", "Text", "Receipt"])
+
+    if any(w in q for w in ["outdoor", "outside", "nature"]):
+        filters.setdefault("tags", []).extend(["Outdoor", "Nature", "Tree", "Mountain", "Water"])
+
+    return filters
+
+
+def search_photos(
+    text: str = None,
+    tags: list[str] = None,
+    min_faces: int = None,
+    max_faces: int = None,
+    date_from: str = None,
+    date_to: str = None,
+    camera: str = None,
+) -> list[dict]:
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    query = "SELECT * FROM photos WHERE 1=1"
+    params: list = []
+
+    if text:
+        query += " AND filename LIKE ?"
+        params.append(f"%{text}%")
+
+    if tags:
+        for t in tags:
+            query += " AND tags LIKE ?"
+            params.append(f"%{t}%")
+
+    if min_faces is not None:
+        query += " AND face_count >= ?"
+        params.append(min_faces)
+
+    if max_faces is not None:
+        query += " AND face_count <= ?"
+        params.append(max_faces)
+
+    if date_from:
+        query += " AND date_taken >= ?"
+        params.append(date_from)
+
+    if date_to:
+        query += " AND date_taken <= ?"
+        params.append(date_to)
+
+    if camera:
+        query += " AND camera_model LIKE ?"
+        params.append(f"%{camera}%")
+
+    cur.execute(query, params)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    for r in rows:
+        if r.get("tags"):
+            try:
+                tags_list = json.loads(r["tags"])
+                r["tags"] = ", ".join(tags_list[:5])
+            except Exception:
+                pass
+
+    return rows
+
+
+# ------------------------------------------------------------
+# Timeline helpers
+# ------------------------------------------------------------
+
+def get_timeline_buckets() -> list[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            substr(date_taken, 1, 4) AS year,
+            substr(date_taken, 6, 2) AS month,
+            COUNT(*) as count
+        FROM photos
+        WHERE date_taken IS NOT NULL
+        GROUP BY year, month
+        ORDER BY year DESC, month DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    buckets: list[dict] = []
+    for r in rows:
+        year = r["year"]
+        month = r["month"]
+        if not year or not month:
+            continue
+        buckets.append(
+            {
+                "year": int(year),
+                "month": int(month),
+                "count": r["count"],
+            }
+        )
+    return buckets
+
+
+def get_timeline_photos(year: int, month: int) -> list[dict]:
+    y = f"{year:04d}"
+    m = f"{month:02d}"
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT * FROM photos
+        WHERE date_taken LIKE ?
+        ORDER BY date_taken ASC
+        """,
+        (f"{y}-{m}-%",),
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    for r in rows:
+        if r.get("tags"):
+            try:
+                tags = json.loads(r["tags"])
+                r["tags"] = ", ".join(tags[:5])
+            except Exception:
+                pass
+
+    return rows
+
+
+# ------------------------------------------------------------
+# Templates (dark mode, background design)
+# ------------------------------------------------------------
+
+BASE_CSS = """
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #05060a;
+    --bg-alt: #0b0d14;
+    --card: #11141f;
+    --border: #262a3a;
+    --accent: #4f8cff;
+    --accent-soft: rgba(79,140,255,0.15);
+    --text: #e6e9ff;
+    --muted: #9aa0c2;
+  }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background:
+      radial-gradient(circle at 0% 0%, #1b1f3b 0, transparent 55%),
+      radial-gradient(circle at 100% 100%, #1a3b3b 0, transparent 55%),
+      radial-gradient(circle at 0% 100%, #3b1a2a 0, transparent 55%),
+      linear-gradient(135deg, #05060a, #05060a 60%, #05060a);
+    color: var(--text);
+  }
+  .shell {
+    padding: 16px 24px 32px 24px;
+  }
+  h1, h2, h3, h4 { margin: 0 0 10px 0; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .nav {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 12px;
+  }
+  .nav a {
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.04);
+    font-size: 13px;
+  }
+  .nav a:hover {
+    background: rgba(255,255,255,0.06);
+  }
+  .nav-right {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .chip-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+  }
+  .chip {
+    padding: 3px 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.06);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  .chip:hover {
+    background: rgba(255,255,255,0.08);
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    background: rgba(0,0,0,0.25);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  th, td {
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+    padding: 6px 8px;
+    font-size: 12px;
+    vertical-align: top;
+  }
+  th {
+    background: rgba(0,0,0,0.4);
+    text-align: left;
+  }
+  tr:last-child td {
+    border-bottom: none;
+  }
+  img.thumb {
+    max-width: 160px;
+    max-height: 160px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.08);
+    display: block;
+  }
+  .tags {
+    font-size: 11px;
+    color: var(--muted);
+  }
+  input, select {
+    background: rgba(0,0,0,0.4);
+    border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: var(--text);
+    font-size: 12px;
+  }
+  button {
+    background: var(--accent);
+    border: none;
+    border-radius: 999px;
+    padding: 5px 12px;
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  button:hover {
+    background: #3b6fe0;
+  }
+  .pill {
+    display: inline-block;
+    padding: 2px 6px;
+    margin: 1px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.06);
+    font-size: 11px;
+  }
+  .meta-small {
+    font-size: 11px;
+    color: var(--muted);
+  }
+</style>
+<script>
+  document.addEventListener('DOMContentLoaded', () => {
+    const saved = localStorage.getItem('theme');
+    if (saved === 'light') {
+      document.documentElement.classList.add('light');
+    }
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'r' || e.key === 'R') {
+        window.location.href = '/random';
+      }
+    });
+  });
+</script>
+"""
+
+AUTOREFRESH_JS = """
+<script>
+setInterval(function() {
+  if (document.visibilityState === 'visible') {
+    location.reload();
+  }
+}, 30000);
+</script>
+"""
+
+DASHBOARD_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>Library</title>
+  """ + BASE_CSS + AUTOREFRESH_JS + """
+</head>
+<body>
+  <div class="shell">
+    <h1>Library</h1>
+    <div class="nav">
+      <a href="/">Latest</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+      <div class="nav-right">
+        <span>Total: {{ count }}</span>
+      </div>
+    </div>
+
+    <div class="chip-row">
+      <span class="chip" onclick="location.href='/album/People'">People</span>
+      <span class="chip" onclick="location.href='/album/No People'">No People</span>
+      <span class="chip" onclick="location.href='/album/Cars'">Cars</span>
+      <span class="chip" onclick="location.href='/album/Outdoors'">Outdoors</span>
+      <span class="chip" onclick="location.href='/documents'">Documents</span>
+    </div>
+
+    <form method="get" action="/search" style="margin-bottom:8px;">
+      <input type="text" name="text" placeholder="Filename text">
+      <input list="tags_list" name="tags" placeholder="Tags (comma-separated)">
+      <datalist id="tags_list"></datalist>
+      <input type="number" name="min_faces" placeholder="Min faces" min="0">
+      <input type="number" name="max_faces" placeholder="Max faces" min="0">
+      <input type="text" name="date_from" placeholder="Date from (YYYY-MM-DD)">
+      <input type="text" name="date_to" placeholder="Date to (YYYY-MM-DD)">
+      <input list="camera_list" name="camera" placeholder="Camera">
+      <datalist id="camera_list"></datalist>
+      <button type="submit">Search</button>
+    </form>
+
+    <form method="post" action="/album_nl" style="margin-bottom:12px;">
+      <input type="text" name="query" style="width:320px;"
+             placeholder="Natural language album (e.g. 'dogs in 2024 at night')">
+      <button type="submit">Create album</button>
+    </form>
+
+    <table>
+      <tr>
+        <th>Thumb</th>
+        <th>Filename</th>
+        <th>Faces</th>
+        <th>Tags</th>
+        <th>Date Taken</th>
+        <th>Actions</th>
+      </tr>
+      {% for row in rows %}
+      <tr>
+        <td><img src="/thumb/{{ row['sha256'] }}" class="thumb"></td>
+        <td>
+          {% if row['filename'].lower().endswith(('.pdf','.docx','.xlsx','.txt','.md')) %}
+            <a href="/document/{{ row['sha256'] }}">{{ row["filename"] }}</a><br>
+          {% else %}
+            <a href="/viewer/{{ row['sha256'] }}">{{ row["filename"] }}</a><br>
+          {% endif %}
+          <span class="meta-small">{{ row["camera_model"] or "" }}</span>
+        </td>
+        <td>{{ row["face_count"] }}</td>
+        <td class="tags">{{ row["tags"] }}</td>
+        <td>{{ row["date_taken"] }}</td>
+        <td>
+          {% if row['filename'].lower().endswith(('.pdf','.docx','.xlsx','.txt','.md')) %}
+            <a href="/document/{{ row['sha256'] }}">View</a> |
+          {% else %}
+            <a href="/viewer/{{ row['sha256'] }}">View</a> |
+          {% endif %}
+          <a href="/download/{{ row['sha256'] }}">Download</a> |
+          <a href="/similar/{{ row['sha256'] }}">Similar faces</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+
+  <script>
+    fetch('/api/distinct_tags').then(r => r.json()).then(tags => {
+      const dl = document.getElementById('tags_list');
+      tags.forEach(t => {
+        const opt = document.createElement('option');
+        opt.value = t;
+        dl.appendChild(opt);
+      });
+    });
+    fetch('/api/distinct_cameras').then(r => r.json()).then(cams => {
+      const dl = document.getElementById('camera_list');
+      cams.forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c;
+        dl.appendChild(opt);
+      });
+    });
+  </script>
+</body>
+</html>
+"""
+
+VIEWER_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>{{ photo['filename'] }}</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="shell" style="max-width:1600px; margin:0 auto;">
+
+    <div class="nav" style="margin-bottom:16px;">
+      <a href="/">Library</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+
+      <div class="nav-right" style="margin-left:auto;">
+        <a href="/download/{{ photo['sha256'] }}">Download</a>
+      </div>
+    </div>
+
+    <div style="
+      display:flex;
+      gap:24px;
+      margin-top:8px;
+      align-items:flex-start;
+    ">
+
+      <div style="
+        flex:3;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        background:rgba(255,255,255,0.02);
+        border-radius:12px;
+        padding:16px;
+        border:1px solid rgba(255,255,255,0.06);
+      ">
+        <img src="/thumb/{{ photo['sha256'] }}"
+             style="
+               max-width:100%;
+               max-height:82vh;
+               border-radius:10px;
+               border:1px solid rgba(255,255,255,0.1);
+             ">
+      </div>
+
+      <div style="
+        flex:2;
+        background:rgba(255,255,255,0.03);
+        border-radius:12px;
+        padding:20px;
+        border:1px solid rgba(255,255,255,0.06);
+      ">
+
+        <h2 style="margin-top:0; margin-bottom:6px;">
+          {{ photo['filename'] }}
+        </h2>
+
+        <div class="meta-small" style="margin-bottom:12px;">
+          {{ photo['original_path'] }}
+        </div>
+
+        <p><strong>Date taken:</strong> {{ photo['date_taken'] }}</p>
+        <p><strong>Camera:</strong> {{ photo['camera_model'] }}</p>
+        <p><strong>Faces:</strong> {{ photo['face_count'] }}</p>
+
+        <p><strong>Tags:</strong><br>
+          {% for t in photo['tags_list'] %}
+            <span class="pill">{{ t }}</span>
+          {% endfor %}
+        </p>
+
+        {% if photo['vision_pairs'] %}
+        <h3 style="margin-top:24px;">Google Vision Analysis</h3>
+        <div style="margin-bottom:12px;">
+          {% for t,score in photo['vision_pairs'] %}
+            <span class="pill">{{ t }} ({{ "%.2f"|format(score) }})</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+
+        {% if photo['face_data_list'] %}
+        <h4 style="margin-top:20px;">Face Data</h4>
+        <pre style="
+          font-size:11px;
+          white-space:pre-wrap;
+          background:rgba(255,255,255,0.05);
+          padding:10px;
+          border-radius:8px;
+        ">{{ photo['face_data_list'] | tojson(indent=2) }}</pre>
+        {% endif %}
+
+        <h4 style="margin-top:24px;">Raw metadata</h4>
+        <pre style="
+          font-size:11px;
+          white-space:pre-wrap;
+          background:rgba(255,255,255,0.05);
+          padding:10px;
+          border-radius:8px;
+        ">{{ photo | tojson(indent=2) }}</pre>
+
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+# Document list + viewer templates
+
+DOCUMENTS_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>Documents</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="shell">
+    <h1>Documents</h1>
+    <div class="nav">
+      <a href="/">Latest</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+    </div>
+
+    <div style="display:flex;flex-wrap:wrap;gap:20px;margin-top:10px;">
+      {% for doc in docs %}
+        <div style="width:220px;">
+          <a href="/document/{{ doc['sha'] }}">
+            <img src="/thumb/{{ doc['sha'] }}" style="width:220px;height:220px;object-fit:cover;border-radius:10px;border:1px solid rgba(255,255,255,0.1);">
+            <div style="margin-top:6px;font-weight:600;font-size:13px;word-break:break-all;">
+              {{ doc['filename'] }}
+            </div>
+          </a>
+          <div class="meta-small">
+            {% for t in doc['tags'][:4] %}
+              <span class="pill">{{ t }}</span>
+            {% endfor %}
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+DOCUMENT_VIEW_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>{{ doc['filename'] }}</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="shell" style="max-width:1600px; margin:0 auto;">
+
+    <div class="nav" style="margin-bottom:16px;">
+      <a href="/">Library</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+
+      <div class="nav-right" style="margin-left:auto;">
+        <a href="/download/{{ doc['sha'] }}">Download</a>
+      </div>
+    </div>
+
+    <div style="
+      display:flex;
+      gap:24px;
+      margin-top:8px;
+      align-items:flex-start;
+    ">
+
+      <div style="
+        flex:3;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        background:rgba(255,255,255,0.02);
+        border-radius:12px;
+        padding:16px;
+        border:1px solid rgba(255,255,255,0.06);
+      ">
+        <img src="/thumb/{{ doc['sha'] }}"
+             style="
+               max-width:100%;
+               max-height:82vh;
+               border-radius:10px;
+               border:1px solid rgba(255,255,255,0.1);
+             ">
+      </div>
+
+      <div style="
+        flex:2;
+        background:rgba(255,255,255,0.03);
+        border-radius:12px;
+        padding:20px;
+        border:1px solid rgba(255,255,255,0.06);
+      ">
+
+        <h2 style="margin-top:0; margin-bottom:6px;">
+          {{ doc['filename'] }}
+        </h2>
+
+        <div class="meta-small" style="margin-bottom:12px;">
+          {{ doc['original_path'] }}
+        </div>
+
+        <p><strong>Type:</strong> {{ doc['kind'] }}</p>
+
+        <p><strong>Tags:</strong><br>
+          {% for t in doc['tags'] %}
+            <span class="pill">{{ t }}</span>
+          {% endfor %}
+        </p>
+
+        <h4 style="margin-top:24px;">Raw metadata</h4>
+        <pre style="
+          font-size:11px;
+          white-space:pre-wrap;
+          background:rgba(255,255,255,0.05);
+          padding:10px;
+          border-radius:8px;
+        ">{{ doc | tojson(indent=2) }}</pre>
+
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+PEOPLE_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>People</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="shell">
+    <h1>People</h1>
+    <div class="nav">
+      <a href="/">Latest</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+    </div>
+    <div style="display:flex; flex-wrap:wrap; gap:16px; margin-top:10px;">
+      {% for person in people %}
+        <div style="text-align:center;">
+          <a href="/person/{{ person['id'] }}">
+            <img src="/face_thumb/{{ person['rep_sha'] }}" style="width:160px;height:160px;object-fit:cover;border-radius:8px;border:1px solid rgba(255,255,255,0.1);">
+          </a>
+          <div class="meta-small">{{ person['count'] }} photos</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+ALBUMS_GRID_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>Smart Albums</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="shell">
+    <h1>Smart Albums</h1>
+    <div class="nav">
+      <a href="/">Latest</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:20px;margin-top:10px;">
+      {% for album in albums %}
+        <div style="width:220px;cursor:pointer;" onclick="location.href='/album/{{ album['name'] }}'">
+          <img src="/thumb/{{ album['rep_sha'] }}" style="width:220px;height:220px;object-fit:cover;border-radius:10px;border:1px solid rgba(255,255,255,0.1);">
+          <div style="margin-top:6px;font-weight:600;">{{ album['name'] }}</div>
+          <div class="meta-small">{{ album['count'] }} photos</div>
+          <div class="meta-small">{{ album['desc'] }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+TIMELINE_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>Timeline</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="shell">
+    <h1>Timeline</h1>
+    <div class="nav">
+      <a href="/">Latest</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+    </div>
+    <ul style="list-style:none;padding:0;margin-top:10px;">
+      {% for item in buckets %}
+        <li style="margin-bottom:6px;">
+          <a href="/timeline/{{ item['year'] }}/{{ '%02d'|format(item['month']) }}">
+            {{ item['year'] }}-{{ '%02d'|format(item['month']) }}
+          </a>
+          <span class="meta-small">({{ item['count'] }} photos)</span>
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+</body>
+</html>
+"""
+
+ALBUM_NL_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>NL Album</title>
+  """ + BASE_CSS + """
+</head>
+<body>
+  <div class="shell">
+    <h1>Album: {{ query }}</h1>
+    <div class="nav">
+      <a href="/">Latest</a>
+      <a href="/albums">Smart Albums</a>
+      <a href="/documents">Documents</a>
+      <a href="/timeline">Timeline</a>
+      <a href="/people">People</a>
+      <a href="/map">Map</a>
+      <a href="/random">Random</a>
+    </div>
+    <p class="meta-small">{{ count }} photos</p>
+    <table>
+      <tr>
+        <th>Thumb</th>
+        <th>Filename</th>
+        <th>Faces</th>
+        <th>Tags</th>
+        <th>Date Taken</th>
+      </tr>
+      {% for row in rows %}
+      <tr>
+        <td><img src="/thumb/{{ row['sha256'] }}" class="thumb"></td>
+        <td><a href="/viewer/{{ row['sha256'] }}">{{ row['filename'] }}</a></td>
+        <td>{{ row['face_count'] }}</td>
+        <td class="tags">{{ row['tags'] }}</td>
+        <td>{{ row['date_taken'] }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+</body>
+</html>
+"""
+
+MAP_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <title>Photo Map</title>
+  """ + BASE_CSS + """
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <style>
+    #map { width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([20, 0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+    fetch('/api/map_points')
+      .then(r => r.json())
+      .then(points => {
+        points.forEach(p => {
+          const m = L.marker([p.gps_lat, p.gps_lon]).addTo(map);
+          m.bindPopup(
+            '<a href="/viewer/' + p.sha256 + '">' +
+            '<img src="/thumb/' + p.sha256 + '" style="max-width:200px;"><br>' +
+            p.filename +
+            '</a>'
+          );
+        });
+      });
+  </script>
+</body>
+</html>
+"""
+
+# ------------------------------------------------------------
+# Core routes
+# ------------------------------------------------------------
+
+@app.route("/")
+def index():
+    rows, count = _load_rows()
+    return render_template_string(DASHBOARD_TEMPLATE, rows=rows, count=count)
+
+
+@app.route("/viewer/<sha>")
+def viewer_page(sha: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM photos WHERE sha256 = ?", (sha,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return "Not found", 404
+
+    photo = dict(row)
+
+    tags_raw = photo.get("tags")
+    scores_raw = photo.get("tag_scores")
+
+    try:
+        tags_list = json.loads(tags_raw) if tags_raw else []
+        scores_list = json.loads(scores_raw) if scores_raw else []
+        photo["tags_list"] = tags_list
+        photo["vision_pairs"] = list(zip(tags_list, scores_list))
+    except Exception:
+        photo["tags_list"] = []
+        photo["vision_pairs"] = []
+
+    try:
+        face_data = json.loads(photo.get("face_data") or "[]")
+        photo["face_data_list"] = face_data
+    except Exception:
+        photo["face_data_list"] = []
+
+    return render_template_string(VIEWER_TEMPLATE, photo=photo)
+
+
+@app.route("/download/<sha>")
+def download_photo(sha: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT original_path, filename FROM photos WHERE sha256 = ?", (sha,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return "Not found", 404
+    orig = row["original_path"]
+    filename = row["filename"]
+    if not orig or not os.path.exists(orig):
+        return "File missing", 404
+    return send_file(orig, as_attachment=True, download_name=filename)
+
+
+@app.route("/thumb/<sha>")
+def thumb(sha: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM photos WHERE sha256 = ?", (sha,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return "Not found", 404
+    row = dict(row)
+    thumb_path = row.get("thumb_path")
+    if not thumb_path or not os.path.exists(thumb_path):
+        thumb_path = _ensure_thumbnail(row)
+    if not thumb_path or not os.path.exists(thumb_path):
+        return "No thumbnail", 404
+    return send_file(thumb_path, mimetype="image/jpeg")
+
+
+@app.route("/face_thumb/<sha>")
+def face_thumb(sha: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM photos WHERE sha256 = ?", (sha,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return "Not found", 404
+    row = dict(row)
+    face_thumb_path = _ensure_face_thumbnail(row)
+    if not face_thumb_path or not os.path.exists(face_thumb_path):
+        return "No face thumbnail", 404
+    return send_file(face_thumb_path, mimetype="image/jpeg")
+
+
+@app.route("/random")
+def random_photo():
+    sha = _random_photo_sha()
+    if not sha:
+        return redirect(url_for("index"))
+    return redirect(url_for("viewer_page", sha=sha))
+
+
+# ------------------------------------------------------------
+# Documents: list + viewer
+# ------------------------------------------------------------
+
+@app.route("/documents")
+def documents_page():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sha256, filename, thumb_path, tags
+        FROM photos
+        WHERE filename LIKE '%.pdf'
+           OR filename LIKE '%.docx'
+           OR filename LIKE '%.xlsx'
+           OR filename LIKE '%.txt'
+           OR filename LIKE '%.md'
+        ORDER BY created_at DESC
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    docs = []
+    for r in rows:
+        tags = []
+        if r["tags"]:
+            try:
+                tags = json.loads(r["tags"])
+            except Exception:
+                tags = []
+        docs.append(
+            {
+                "sha": r["sha256"],
+                "filename": r["filename"],
+                "thumb": r["thumb_path"],
+                "tags": tags,
+            }
+        )
+
+    return render_template_string(DOCUMENTS_TEMPLATE, docs=docs)
+
+
+@app.route("/document/<sha>")
+def document_view(sha: str):
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sha256, filename, original_path, thumb_path, tags, tag_scores
+        FROM photos WHERE sha256 = ?
+        """,
+        (sha,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return "Not found", 404
+
+    tags = []
+    scores = []
+    if row["tags"]:
+        try:
+            tags = json.loads(row["tags"])
+        except Exception:
+            tags = []
+    if row["tag_scores"]:
+        try:
+            scores = json.loads(row["tag_scores"])
+        except Exception:
+            scores = []
+
+    filename = row["filename"].lower()
+    if filename.endswith(".pdf"):
+        kind = "PDF"
+    elif filename.endswith(".docx"):
+        kind = "DOCX"
+    elif filename.endswith(".xlsx"):
+        kind = "XLSX"
+    elif filename.endswith(".txt") or filename.endswith(".md"):
+        kind = "TEXT"
+    else:
+        kind = "FILE"
+
+    doc = {
+        "sha": row["sha256"],
+        "filename": row["filename"],
+        "original_path": row["original_path"],
+        "thumb_path": row["thumb_path"],
+        "tags": tags,
+        "tag_scores": scores,
+        "kind": kind,
+    }
+
+    return render_template_string(DOCUMENT_VIEW_TEMPLATE, doc=doc)
+
+
+# ------------------------------------------------------------
+# Search + NL albums
+# ------------------------------------------------------------
+
+@app.route("/search")
+def search_page():
+    text = request.args.get("text")
+    tags = request.args.get("tags")
+    tags = [t.strip() for t in tags.split(",")] if tags else None
+    min_faces = request.args.get("min_faces", type=int)
+    max_faces = request.args.get("max_faces", type=int)
+    date_from = request.args.get("date_from")
+    date_to = request.args.get("date_to")
+    camera = request.args.get("camera")
+
+    rows = search_photos(
+        text=text,
+        tags=tags,
+        min_faces=min_faces,
+        max_faces=max_faces,
+        date_from=date_from,
+        date_to=date_to,
+        camera=camera,
+    )
+    return render_template_string(DASHBOARD_TEMPLATE, rows=rows, count=len(rows))
+
+
+@app.route("/album_nl", methods=["POST"])
+def album_nl_page():
+    q = request.form.get("query") or ""
+    filters = parse_nl_query(q)
+    rows = search_photos(
+        text=None,
+        tags=filters.get("tags"),
+        min_faces=filters.get("min_faces"),
+        max_faces=None,
+        date_from=filters.get("date_from"),
+        date_to=filters.get("date_to"),
+        camera=None,
+    )
+    return render_template_string(ALBUM_NL_TEMPLATE, query=q, rows=rows, count=len(rows))
+
+
+# ------------------------------------------------------------
+# Albums, timeline, people, map
+# ------------------------------------------------------------
+
+@app.route("/albums")
+def albums_page():
+    albums = []
+    for name, defn in SMART_ALBUM_DEFS.items():
+        rows = _album_query(defn)
+        if not rows:
+            continue
+        rep_sha = rows[0]["sha256"]
+        albums.append({
+            "name": name,
+            "count": len(rows),
+            "rep_sha": rep_sha,
+            "desc": defn.get("desc", ""),
+        })
+    return render_template_string(ALBUMS_GRID_TEMPLATE, albums=albums)
+
+
+@app.route("/album/<name>")
+def album_page(name: str):
+    defn = SMART_ALBUM_DEFS.get(name)
+    if not defn:
+        return "Unknown album", 404
+    rows = _album_query(defn)
+    return render_template_string(DASHBOARD_TEMPLATE, rows=rows, count=len(rows))
+
+
+@app.route("/timeline")
+def timeline_page():
+    buckets = get_timeline_buckets()
+    return render_template_string(TIMELINE_TEMPLATE, buckets=buckets)
+
+
+@app.route("/timeline/<int:year>/<int:month>")
+def timeline_bucket_page(year: int, month: int):
+    rows = get_timeline_photos(year, month)
+    return render_template_string(DASHBOARD_TEMPLATE, rows=rows, count=len(rows))
+
+
+@app.route("/people")
+def people_page():
+    clusters = cluster_faces()
+    people = []
+    for idx, cluster in enumerate(clusters):
+        if not cluster:
+            continue
+        people.append({
+            "id": idx,
+            "rep_sha": cluster[0],
+            "count": len(cluster),
+        })
+    return render_template_string(PEOPLE_TEMPLATE, people=people)
+
+
+@app.route("/person/<int:cluster_id>")
+def person_page(cluster_id: int):
+    clusters = cluster_faces()
+    if cluster_id < 0 or cluster_id >= len(clusters):
+        return "Unknown person", 404
+    sha_list = clusters[cluster_id]
+    if not sha_list:
+        return render_template_string(DASHBOARD_TEMPLATE, rows=[], count=0)
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    placeholders = ",".join("?" for _ in sha_list)
+    cur.execute(f"SELECT * FROM photos WHERE sha256 IN ({placeholders})", sha_list)
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+
+    for r in rows:
+        if r.get("tags"):
+            try:
+                tags = json.loads(r["tags"])
+                r["tags"] = ", ".join(tags[:5])
+            except Exception:
+                pass
+
+    return render_template_string(DASHBOARD_TEMPLATE, rows=rows, count=len(rows))
+
+
+@app.route("/map")
+def map_page():
+    return render_template_string(MAP_TEMPLATE)
+
+
+# ------------------------------------------------------------
+# Similar faces + API helpers
+# ------------------------------------------------------------
+
+@app.route("/similar/<sha>")
+def similar_page(sha: str):
+    sims = find_similar_faces(sha)
+    return jsonify(sims)
+
+
+@app.route("/api/distinct_tags")
+def api_distinct_tags():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT tags FROM photos WHERE tags IS NOT NULL")
+    rows = cur.fetchall()
+    conn.close()
+
+    tags_set = set()
+    for r in rows:
+        try:
+            data = json.loads(r["tags"])
+            if isinstance(data, list):
+                for t in data:
+                    tags_set.add(str(t))
+        except Exception:
+            pass
+
+    return jsonify(sorted(tags_set))
+
+
+@app.route("/api/distinct_cameras")
+def api_distinct_cameras():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT camera_model FROM photos WHERE camera_model IS NOT NULL")
+    rows = [r["camera_model"] for r in cur.fetchall() if r["camera_model"]]
+    conn.close()
+    return jsonify(sorted(rows))
+
+
+@app.route("/api/map_points")
+def api_map_points():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT sha256, filename, gps_lat, gps_lon
+        FROM photos
+        WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL
+        """
+    )
+    rows = [dict(r) for r in cur.fetchall()]
+    conn.close()
+    return jsonify(rows)
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+def run_dashboard(host: str = "127.0.0.1", port: int = 5000):
+    app.run(host=host, port=port, debug=False)
+
+
+if __name__ == "__main__":
+    run_dashboard()

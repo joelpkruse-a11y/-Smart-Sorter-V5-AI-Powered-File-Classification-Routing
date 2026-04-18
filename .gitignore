@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Local Database & Logs
+faces.db
+*.log
+
+# Mac/Windows System files
+.DS_Store
+Thumbs.db
+
+google_vision_key.json

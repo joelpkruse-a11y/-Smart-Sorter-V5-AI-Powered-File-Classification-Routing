@@ -1,0 +1,11 @@
+<JSON>
+{
+  "text": "",
+  "category": "",
+  "confidence": 0.0,
+  "metadata": {},
+  "tables": [],
+  "filename": "",
+  "reasoning": "No document was provided for processing."
+}
+</JSON>

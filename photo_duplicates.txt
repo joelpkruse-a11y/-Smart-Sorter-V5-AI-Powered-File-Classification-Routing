@@ -1,0 +1,537 @@
+# ============================================================
+# PHOTO INTELLIGENCE CORE (PATCHED)
+# Hybrid SHA256 + pHash + Persistent SQLite
+# + EXIF metadata
+# + Google Vision faces + labels
+# + Face similarity + clustering
+# + Thumbnail path for dashboard (WebP)
+# ============================================================
+
+from pathlib import Path
+from typing import Tuple, List, Dict, Any
+import hashlib
+import sqlite3
+import mimetypes
+import json
+import math
+import time
+from datetime import datetime
+
+from PIL import Image, ExifTags, ImageOps
+import imagehash
+from google.cloud import vision
+
+# ------------------------------------------------------------
+# PATHS / CONSTANTS
+# ------------------------------------------------------------
+DB_PATH = Path("photo_duplicates.db")
+PHASH_THRESHOLD = 5
+
+THUMB_ROOT = Path(r"C:\SmartInbox\thumbs")
+THUMB_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------------------------------------------
+# SAFE FILE ACCESS
+# ------------------------------------------------------------
+def _safe_open(path: Path):
+    """Safely open a file, retrying if OneDrive is syncing."""
+    for _ in range(5):
+        try:
+            return open(path, "rb")
+        except Exception:
+            time.sleep(0.15)
+    raise FileNotFoundError(f"[PHOTO] Could not safely open file: {path}")
+
+
+# ------------------------------------------------------------
+# SAFE PHASH → HEX
+# ------------------------------------------------------------
+def _phash_to_hex(ph) -> str | None:
+    if ph is None:
+        return None
+    if hasattr(ph, "hash"):
+        arr = ph.hash
+    else:
+        arr = ph
+    try:
+        flat = arr.flatten()
+        bits = "".join("1" if x else "0" for x in flat)
+        return hex(int(bits, 2))[2:]
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------
+# DB INIT + MIGRATION
+# ------------------------------------------------------------
+def _init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS duplicates (
+            sha256 TEXT PRIMARY KEY,
+            phash TEXT
+        )
+        """
+    )
+
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS photos (
+            sha256 TEXT PRIMARY KEY,
+            phash TEXT,
+            filename TEXT,
+            original_path TEXT,
+            date_taken TEXT,
+            camera_model TEXT,
+            width INTEGER,
+            height INTEGER,
+            file_size INTEGER,
+            mime_type TEXT,
+            gps_lat REAL,
+            gps_lon REAL,
+            face_count INTEGER,
+            face_data TEXT,
+            tags TEXT,
+            tag_scores TEXT,
+            thumb_path TEXT,
+            created_at TEXT
+        )
+        """
+    )
+
+    cur.execute("PRAGMA table_info(photos)")
+    cols = [row[1] for row in cur.fetchall()]
+
+    if "face_count" not in cols:
+        cur.execute("ALTER TABLE photos ADD COLUMN face_count INTEGER")
+    if "face_data" not in cols:
+        cur.execute("ALTER TABLE photos ADD COLUMN face_data TEXT")
+    if "tags" not in cols:
+        cur.execute("ALTER TABLE photos ADD COLUMN tags TEXT")
+    if "tag_scores" not in cols:
+        cur.execute("ALTER TABLE photos ADD COLUMN tag_scores TEXT")
+    if "thumb_path" not in cols:
+        cur.execute("ALTER TABLE photos ADD COLUMN thumb_path TEXT")
+
+    conn.commit()
+    conn.close()
+
+
+_init_db()
+
+# ------------------------------------------------------------
+# IN-MEMORY HASHES
+# ------------------------------------------------------------
+PROCESSED_SHA256: set[str] = set()
+PROCESSED_PHASH: set[imagehash.ImageHash] = set()
+
+
+def _load_existing_hashes():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    for sha, ph in cur.execute("SELECT sha256, phash FROM duplicates"):
+        PROCESSED_SHA256.add(sha)
+        if ph:
+            try:
+                PROCESSED_PHASH.add(imagehash.hex_to_hash(ph))
+            except Exception:
+                pass
+    conn.close()
+
+
+_load_existing_hashes()
+
+
+# ------------------------------------------------------------
+# HASH PERSISTENCE
+# ------------------------------------------------------------
+def _save_hashes(sha: str, ph):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO duplicates (sha256, phash) VALUES (?, ?)",
+        (sha, _phash_to_hex(ph)),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------------
+# SHA-256 (RACE-SAFE)
+# ------------------------------------------------------------
+def sha256_hash(path: Path) -> str:
+    h = hashlib.sha256()
+    with _safe_open(path) as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ------------------------------------------------------------
+# PERCEPTUAL HASH
+# ------------------------------------------------------------
+def perceptual_hash(path: Path):
+    try:
+        img = Image.open(path)
+        return imagehash.phash(img)
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------
+# EXIF METADATA
+# ------------------------------------------------------------
+def extract_photo_metadata(path: Path) -> dict:
+    meta = {
+        "filename": path.name,
+        "original_path": str(path),
+        "date_taken": None,
+        "camera_model": None,
+        "width": None,
+        "height": None,
+        "file_size": path.stat().st_size,
+        "mime_type": mimetypes.guess_type(path)[0],
+        "gps_lat": None,
+        "gps_lon": None,
+        "face_count": None,
+        "face_data": None,
+        "tags": None,
+        "tag_scores": None,
+        "thumb_path": None,
+        "created_at": datetime.now().isoformat(),
+    }
+
+    try:
+        img = Image.open(path)
+        meta["width"], meta["height"] = img.size
+
+        exif = img.getexif()
+        if exif:
+            exif_data = {ExifTags.TAGS.get(k, k): v for k, v in exif.items()}
+
+            dt = exif_data.get("DateTimeOriginal") or exif_data.get("DateTime")
+            if dt:
+                meta["date_taken"] = dt
+
+            meta["camera_model"] = exif_data.get("Model")
+
+            gps = exif_data.get("GPSInfo")
+            if gps:
+                lat = gps.get(2)
+                lon = gps.get(4)
+                if lat and lon:
+                    meta["gps_lat"] = _convert_gps(lat)
+                    meta["gps_lon"] = _convert_gps(lon)
+
+    except Exception:
+        pass
+
+    return meta
+
+
+def _convert_gps(value):
+    try:
+        d = value[0][0] / value[0][1]
+        m = value[1][0] / value[1][1]
+        s = value[2][0] / value[2][1]
+        return d + (m / 60.0) + (s / 3600.0)
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------
+# GOOGLE VISION: FACES
+# ------------------------------------------------------------
+def detect_faces_google_vision(path: Path) -> dict:
+    try:
+        client = vision.ImageAnnotatorClient()
+        with _safe_open(path) as f:
+            content = f.read()
+        image = vision.Image(content=content)
+        response = client.face_detection(image=image)
+        faces = response.face_annotations or []
+
+        face_dicts: List[Dict[str, Any]] = []
+        for f in faces:
+            face_dicts.append(
+                {
+                    "joy": f.joy_likelihood,
+                    "sorrow": f.sorrow_likelihood,
+                    "anger": f.anger_likelihood,
+                    "surprise": f.surprise_likelihood,
+                    "confidence": f.detection_confidence,
+                    "bounding_poly": {
+                        "vertices": [{"x": v.x, "y": v.y} for v in f.bounding_poly.vertices]
+                    },
+                }
+            )
+
+        return {
+            "face_count": len(faces),
+            "face_data": json.dumps(face_dicts),
+        }
+    except Exception:
+        return {
+            "face_count": 0,
+            "face_data": None,
+        }
+
+
+# ------------------------------------------------------------
+# GOOGLE VISION: LABELS / TAGS
+# ------------------------------------------------------------
+def detect_labels_google_vision(path: Path) -> dict:
+    try:
+        client = vision.ImageAnnotatorClient()
+        with _safe_open(path) as f:
+            content = f.read()
+        image = vision.Image(content=content)
+        response = client.label_detection(image=image)
+        labels = response.label_annotations or []
+
+        names = [l.description for l in labels]
+        scores = [float(l.score) for l in labels]
+
+        return {
+            "tags": json.dumps(names),
+            "tag_scores": json.dumps(scores),
+        }
+    except Exception:
+        return {
+            "tags": None,
+            "tag_scores": None,
+        }
+
+
+# ------------------------------------------------------------
+# THUMBNAIL GENERATION (WEBP)
+# ------------------------------------------------------------
+def _generate_thumbnail(path: Path, sha: str) -> str | None:
+    try:
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)
+        img.thumbnail((256, 256))
+        thumb_path = THUMB_ROOT / f"{sha}.webp"
+        img.save(thumb_path, "WEBP", quality=80, method=6)
+        return str(thumb_path)
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------
+# SAVE PHOTO METADATA
+# ------------------------------------------------------------
+def save_photo_metadata(sha: str, ph, meta: dict):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO photos (
+            sha256, phash, filename, original_path, date_taken,
+            camera_model, width, height, file_size, mime_type,
+            gps_lat, gps_lon, face_count, face_data,
+            tags, tag_scores, thumb_path, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            sha,
+            _phash_to_hex(ph),
+            meta["filename"],
+            meta["original_path"],
+            meta["date_taken"],
+            meta["camera_model"],
+            meta["width"],
+            meta["height"],
+            meta["file_size"],
+            meta["mime_type"],
+            meta["gps_lat"],
+            meta["gps_lon"],
+            meta.get("face_count"),
+            meta.get("face_data"),
+            meta.get("tags"),
+            meta.get("tag_scores"),
+            meta.get("thumb_path"),
+            meta["created_at"],
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------------
+# HYBRID DUPLICATE + METADATA PIPELINE (AUTHORITATIVE)
+# ------------------------------------------------------------
+def is_photo_duplicate(path: Path) -> Tuple[bool, str]:
+    """
+    Authoritative photo duplicate + metadata pipeline.
+    - SHA256 + pHash duplicate detection
+    - EXIF metadata
+    - Google Vision faces + labels (GV1)
+    - Thumbnail generation (WebP, global cache)
+    - Persistent SQLite storage
+    """
+    if not path.exists():
+        return False, ""
+
+    sha = sha256_hash(path)
+    ph = perceptual_hash(path)
+
+    # SHA256 duplicate
+    if sha in PROCESSED_SHA256:
+        # Still run Vision + metadata so DB stays complete
+        meta = extract_photo_metadata(path)
+        meta.update(detect_faces_google_vision(path))
+        meta.update(detect_labels_google_vision(path))
+        meta["thumb_path"] = _generate_thumbnail(path, sha)
+        save_photo_metadata(sha, ph, meta)
+        _save_hashes(sha, ph)
+        return True, "sha256"
+
+    # pHash duplicate
+    if ph:
+        for existing in PROCESSED_PHASH:
+            try:
+                if ph - existing <= PHASH_THRESHOLD:
+                    meta = extract_photo_metadata(path)
+                    meta.update(detect_faces_google_vision(path))
+                    meta.update(detect_labels_google_vision(path))
+                    meta["thumb_path"] = _generate_thumbnail(path, sha)
+                    save_photo_metadata(sha, ph, meta)
+                    PROCESSED_SHA256.add(sha)
+                    PROCESSED_PHASH.add(ph)
+                    _save_hashes(sha, ph)
+                    return True, "phash"
+            except Exception:
+                pass
+
+    # Not a duplicate → full pipeline
+    meta = extract_photo_metadata(path)
+    meta.update(detect_faces_google_vision(path))
+    meta.update(detect_labels_google_vision(path))
+    meta["thumb_path"] = _generate_thumbnail(path, sha)
+
+    save_photo_metadata(sha, ph, meta)
+
+    PROCESSED_SHA256.add(sha)
+    if ph:
+        PROCESSED_PHASH.add(ph)
+    _save_hashes(sha, ph)
+
+    return False, ""
+
+
+# ------------------------------------------------------------
+# FACE FEATURE VECTORS
+# ------------------------------------------------------------
+def _face_feature_vector(face_entry: dict) -> List[float]:
+    bp = face_entry.get("bounding_poly", {}).get("vertices", [])
+    if not bp:
+        return [0.0, 0.0, 0.0, 0.0]
+    xs = [v.get("x", 0.0) for v in bp]
+    ys = [v.get("y", 0.0) for v in bp]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    cx = (min_x + max_x) / 2.0
+    cy = (min_y + max_y) / 2.0
+    w = max_x - min_x
+    h = max_y - min_y
+    return [cx, cy, w, h]
+
+
+def _cosine_similarity(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+# ------------------------------------------------------------
+# FIND SIMILAR FACES
+# ------------------------------------------------------------
+def find_similar_faces(target_sha: str, top_k: int = 10) -> List[dict]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("SELECT sha256, face_data FROM photos WHERE sha256 = ?", (target_sha,))
+    row = cur.fetchone()
+    if not row or not row[1]:
+        conn.close()
+        return []
+
+    target_faces = json.loads(row[1])
+    if not target_faces:
+        conn.close()
+        return []
+
+    target_vec = _face_feature_vector(target_faces[0])
+
+    cur.execute("SELECT sha256, face_data FROM photos WHERE face_data IS NOT NULL")
+    candidates = cur.fetchall()
+    conn.close()
+
+    scores: List[tuple[str, float]] = []
+    for sha, face_json in candidates:
+        if sha == target_sha or not face_json:
+            continue
+        try:
+            faces = json.loads(face_json)
+            if not faces:
+                continue
+            vec = _face_feature_vector(faces[0])
+            sim = _cosine_similarity(target_vec, vec)
+            scores.append((sha, sim))
+        except Exception:
+            continue
+
+    scores.sort(key=lambda x: x[1], reverse=True)
+    return [{"sha256": s[0], "similarity": s[1]} for s in scores[:top_k]]
+
+
+# ------------------------------------------------------------
+# SIMPLE FACE CLUSTERING
+# ------------------------------------------------------------
+def cluster_faces(min_similarity: float = 0.8) -> List[List[str]]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT sha256, face_data FROM photos WHERE face_data IS NOT NULL")
+    rows = cur.fetchall()
+    conn.close()
+
+    items: List[tuple[str, List[float]]] = []
+    for sha, face_json in rows:
+        if not face_json:
+            continue
+        try:
+            faces = json.loads(face_json)
+            if not faces:
+                continue
+            vec = _face_feature_vector(faces[0])
+            items.append((sha, vec))
+        except Exception:
+            continue
+
+    clusters: List[List[str]] = []
+    for sha, vec in items:
+        placed = False
+        for cluster in clusters:
+            rep_sha = cluster[0]
+            rep_vec = next(v for s, v in items if s == rep_sha)
+            if _cosine_similarity(vec, rep_vec) >= min_similarity:
+                cluster.append(sha)
+                placed = True
+                break
+        if not placed:
+            clusters.append([sha])
+
+    return clusters

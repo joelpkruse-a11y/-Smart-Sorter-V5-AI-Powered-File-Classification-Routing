@@ -1,0 +1,327 @@
+# ============================================================
+# filename_v3_engine.py — Smart Sorter V5.3 (PATCHED)
+# Semantic filename generator with:
+#   - Improved issuer extraction
+#   - Improved date extraction
+#   - Improved doc type inference
+#   - Improved entity extraction
+#   - Clean integration with new AI pipeline
+# ============================================================
+
+import os
+import re
+import inspect
+import json
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+
+from utils import log
+
+# ---------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------
+
+_DATE_PATTERNS = [
+    r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b",
+    r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})\b",
+    r"\b([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})\b",
+]
+
+_VENDOR_KEYS = [
+    "issuer", "vendor", "vendor_name", "merchant", "company", "company_name",
+    "provider", "service_provider", "utility_company", "payer", "institution",
+    "sender"
+]
+
+_ENTITY_KEYS = [
+    "pet_name", "patient_name", "member_name", "employee_name", "person_name"
+]
+
+_DOC_TYPE_PATTERNS = [
+    ("PetClaim",  [r"pet claim form", r"claim form", r"pet insurance claim"]),
+    ("Invoice",   [r"invoice", r"amount due", r"bill"]),
+    ("Statement", [r"statement", r"account summary", r"statement period"]),
+    ("EOB",       [r"explanation of benefits", r"\beob\b"]),
+    ("Policy",    [r"policy", r"declarations page", r"renewal notice"]),
+    ("VisitSummary", [r"visit summary", r"discharge summary"]),
+    ("TaxForm",   [r"\b1099\b", r"\b1040\b", r"\bw-2\b", r"\bw2\b"]),
+    ("SleepStudyReport", [r"sleep apnea", r"sleep study", r"hsat", r"watchpat"]),
+]
+
+BANK_ISSUERS = [
+    "capital one", "chase", "citi", "citibank", "american express",
+    "amex", "discover", "wells fargo", "us bank", "bank of america"
+]
+
+# ---------------------------------------------------------
+# DEBUG ENTRY LOGGER
+# ---------------------------------------------------------
+
+def debug_enter():
+    caller = inspect.stack()[1].function
+    log(f"[DEBUG] ENTERED filename_v3_engine::{caller}", "diag")
+
+# ---------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------
+
+def _sanitize(text: Optional[str]) -> str:
+    debug_enter()
+    if not text:
+        return ""
+    text = str(text).strip()
+    text = re.sub(r"[^\w\- ]+", "", text)
+    text = re.sub(r"\s+", "_", text)
+    return text[:80]
+
+
+def _extract_dates_from_text(text: Optional[str]) -> List[datetime]:
+    debug_enter()
+    dates: List[datetime] = []
+    if not text:
+        return dates
+
+    for pattern in _DATE_PATTERNS:
+        for m in re.finditer(pattern, text):
+            try:
+                if pattern == _DATE_PATTERNS[0]:
+                    y, mth, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                elif pattern == _DATE_PATTERNS[1]:
+                    mth, d, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    if y < 100:
+                        y += 2000
+                else:
+                    month_name, d, y = m.group(1), int(m.group(2)), int(m.group(3))
+                    mth = datetime.strptime(month_name[:3], "%b").month
+                dates.append(datetime(y, mth, d))
+            except Exception:
+                continue
+    return dates
+
+
+def _extract_date_from_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    debug_enter()
+    if not metadata:
+        return None
+
+    for key in ("created", "modified", "creation_time", "modified_time"):
+        val = metadata.get(key)
+        if not val:
+            continue
+        m = re.search(r"(\d{4})-(\d{2})-(\d{2})", str(val))
+        if m:
+            y, mth, d = m.groups()
+            return f"{y}-{mth}-{d}"
+
+    return None
+
+
+def _choose_primary_date(text: Optional[str], metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+    debug_enter()
+    meta_date = _extract_date_from_metadata(metadata or {})
+    if meta_date:
+        return meta_date
+
+    dates = _extract_dates_from_text(text or "")
+    if dates:
+        return sorted(dates)[0].strftime("%Y-%m-%d")
+
+    return None
+
+
+def _extract_issuer(metadata: Optional[Dict[str, Any]], text: Optional[str], category: Optional[str], original_path: str) -> Optional[str]:
+    debug_enter()
+
+    metadata = metadata or {}
+    text = text or ""
+    t = text.lower()
+
+    # XLSX → no issuer
+    if original_path.lower().endswith(".xlsx"):
+        return None
+
+    # 1. Metadata issuer (highest trust)
+    for k in _VENDOR_KEYS:
+        v = metadata.get(k)
+        if isinstance(v, str) and v.strip():
+            if v.strip().lower() == "irs" and (category or "").lower() != "taxes":
+                return None
+            return v.strip()
+
+    # 1b. Raw AI payload
+    raw = metadata.get("raw", {}) or {}
+    if isinstance(raw, dict):
+        for k in _VENDOR_KEYS:
+            v = raw.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+
+    # 2. Explicit issuer detection
+    EXPLICIT_ISSUERS = [
+        "affirm", "affirm inc", "affirm, inc",
+        "verizon", "state farm", "progressive",
+        "geico", "allstate", "united healthcare",
+        "blue cross", "blue shield", "cigna",
+        "paypal", "synchrony", "navy federal",
+        "capital one services", "capital one bank"
+    ]
+    for name in EXPLICIT_ISSUERS:
+        if name in t:
+            return name.replace(",", "").title()
+
+    # 3. IRS fallback
+    if "irs" in t:
+        if (category or "").lower() == "taxes":
+            return "IRS"
+        return None
+
+    # 4. Bank detection (only for statements)
+    if category and (category.lower() in ["financial", "finance", "statement", "credit_card_statement"]):
+        for bank in BANK_ISSUERS:
+            if bank in t:
+                return bank.title()
+
+    # 5. Filename token heuristic
+    try:
+        stem = os.path.splitext(os.path.basename(original_path))[0]
+        tokens = re.split(r'[_\-\s]+', stem)
+        for tkn in tokens:
+            tkn_clean = tkn.strip()
+            if len(tkn_clean) > 3 and re.search(r'[A-Za-z]', tkn_clean):
+                low = tkn_clean.lower()
+                if low not in ("document", "scan", "image", "pdf", "download"):
+                    return tkn_clean
+    except Exception:
+        pass
+
+    # 6. Regex on OCR text
+    m = re.search(
+        r'(Issued by|Issued To|From|Vendor|Payee|Provider)[:\s\-]+([A-Z][A-Za-z0-9 &.,\-]{2,80})',
+        text,
+        re.IGNORECASE
+    )
+    if m:
+        return m.group(2).strip()
+
+    # 7. Known issuers
+    KNOWN_ISSUERS = [
+        "Chase", "JPMorgan", "American Express", "Amex", "Discover",
+        "Capital One", "US Bank", "Wells Fargo", "Verizon", "AT&T",
+        "T-Mobile", "State Farm", "Progressive", "Geico"
+    ]
+    for issuer in KNOWN_ISSUERS:
+        if issuer.lower() in t:
+            return issuer
+
+    return None
+
+
+def _extract_primary_entity(metadata: Optional[Dict[str, Any]], text: Optional[str]) -> Optional[str]:
+    debug_enter()
+    metadata = metadata or {}
+    for k in _ENTITY_KEYS:
+        v = metadata.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    m = re.search(r"pet name[:\s]+([A-Za-z]{2,20})", (text or ""), re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def _infer_doc_type(text: Optional[str], gem_filename: Optional[str], reasoning: Optional[str], category: Optional[str]) -> str:
+    debug_enter()
+    blob = " ".join([text or "", gem_filename or "", reasoning or ""]).lower()
+
+    for label, patterns in _DOC_TYPE_PATTERNS:
+        for p in patterns:
+            if re.search(p, blob):
+                return label
+
+    if category:
+        return category.capitalize()
+
+    return "Document"
+
+# ---------------------------------------------------------
+# PUBLIC API
+# ---------------------------------------------------------
+
+def build_v3_filename(category: Optional[str], metadata: Optional[Dict[str, Any]], text: Optional[str], gem_filename: Optional[str], reasoning: Optional[str], original_path: str) -> str:
+    debug_enter()
+
+    metadata = metadata or {}
+
+    # EXTENSION FIX
+    ext = os.path.splitext(original_path)[1].lower().strip()
+    if not ext or len(ext) > 10 or " " in ext or "(" in ext or ")" in ext:
+        ext = ".pdf"
+
+    primary_date = _choose_primary_date(text, metadata)
+    issuer = _extract_issuer(metadata, text, category, original_path)
+    entity = _extract_primary_entity(metadata, text)
+    doc_type = _infer_doc_type(text, gem_filename, reasoning, category)
+
+    issuer_clean = _sanitize(issuer) if issuer else ""
+    entity_clean = _sanitize(entity) if entity else ""
+    doc_type_clean = _sanitize(doc_type)
+    date_clean = _sanitize(primary_date) if primary_date else ""
+
+    parts: List[str] = []
+
+    # 1) doc_type (if meaningful)
+    if doc_type_clean and doc_type_clean.lower() not in ("document", "file"):
+        parts.append(doc_type_clean)
+
+    # 2) category (if distinct)
+    if category:
+        cat_clean = _sanitize(category)
+        if cat_clean and cat_clean.lower() not in (p.lower() for p in parts):
+            parts.append(cat_clean)
+
+    # 3) issuer (insert at front)
+    if issuer_clean:
+        parts.insert(0, issuer_clean)
+
+    # 4) entity
+    if entity_clean:
+        parts.append(entity_clean)
+
+    # 5) date
+    if date_clean:
+        parts.append(date_clean)
+
+    # fallback
+    if not parts:
+        orig_stem = os.path.splitext(os.path.basename(original_path))[0]
+        orig_clean = _sanitize(orig_stem) or "Document"
+        parts = [orig_clean]
+
+    base = "_".join([p for p in parts if p])
+    filename = f"{base}{ext}"
+
+    log(f"[V3] Synthesized semantic filename: {filename}", "diag")
+    return filename
+
+# ---------------------------------------------------------
+# AI DEBUG DUMP
+# ---------------------------------------------------------
+
+def dump_ai_debug(ai_result: Dict[str, Any], original_filename: str) -> None:
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        debug_dir = os.path.join(os.getcwd(), "ai_debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", original_filename)
+        out_path = os.path.join(debug_dir, f"{ts}__{safe_name}.json")
+        payload = {
+            "ai_result": ai_result,
+            "metadata_raw": ai_result.get("metadata", {}).get("raw") if isinstance(ai_result.get("metadata"), dict) else None
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        log(f"[AI] Wrote debug AI payload to {out_path}", "diag")
+    except Exception as e:
+        log(f"[AI] Failed to write AI debug file: {e}", "error")

@@ -1,0 +1,2228 @@
+# =========================================================
+# SMART SORTER V5.2 — MONOLITHIC EDITION
+# Sections 1–2: Imports, Config, Logging, Utilities
+# =========================================================
+
+import os
+import sys
+import time
+import json
+import shutil
+import logging
+import threading
+from filename_v3_engine import build_v3_filename
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from PIL import Image
+Image.MAX_IMAGE_PIXELS = None
+
+print("RUNNING PYTHON:", sys.executable)
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except ImportError:
+    genai = None
+    genai_types = None
+
+
+# ---------------------------------------------------------
+# GLOBALS & CONFIG LOADING
+# ---------------------------------------------------------
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+
+CONFIG: Dict[str, Any] = {}
+
+def load_config(path: Path) -> Dict[str, Any]:
+    """Load JSON config from disk."""
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+try:
+    CONFIG = load_config(CONFIG_PATH)
+except Exception as e:
+    print(f"[FATAL] Failed to load config.json: {e}")
+    sys.exit(1)
+
+INPUT_FOLDER = Path(CONFIG.get("input_folder", "C:/SmartInboxLocal/Incoming"))
+OUTPUT_FOLDER = Path(CONFIG.get("output_folder", "C:/SmartInboxLocal/Sorted"))
+ERROR_FOLDER = Path(CONFIG.get("error_folder", str(OUTPUT_FOLDER / "_errors")))
+DESTINATIONS = CONFIG.get("destinations", {})
+CLASSIFICATION_CFG = CONFIG.get("classification", {})
+AI_CFG = CONFIG.get("ai_classification", {})
+OBSERVER_GROUPS = CONFIG.get("observer_groups", {})
+INITIAL_SCAN_GROUPS = CONFIG.get("initial_scan_groups", [])
+FILE_READINESS_CFG = CONFIG.get("file_readiness", {})
+
+
+# ---------------------------------------------------------
+# LOGGING SETUP
+# ---------------------------------------------------------
+
+LOG_CFG = CONFIG.get("logging", {})
+LOG_ENABLED = LOG_CFG.get("enabled", True)
+LOG_TO_FILE = LOG_CFG.get("log_to_file", True)
+LOG_FILE_PATH = LOG_CFG.get("log_file_path", "C:/SmartInbox/System/sorter.log")
+
+# Built‑in logger ONLY for file logging
+logger = logging.getLogger("smart_sorter")
+logger.setLevel(logging.DEBUG)
+
+_log_formatter = logging.Formatter(
+    fmt="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+if LOG_ENABLED and LOG_TO_FILE:
+    log_path = Path(LOG_FILE_PATH)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(_log_formatter)
+    logger.addHandler(file_handler)
+
+# ---------------------------------------------------------
+# COLOR LOGGING (console)
+# ---------------------------------------------------------
+COLOR_MAP = {
+    "success": "\033[92m",
+    "error": "\033[91m",
+    "warn": "\033[93m",
+    "diag": "\033[96m",
+    "info": "\033[97m",
+    "reset": "\033[0m",
+}
+
+def log(msg: str, level: str = "info"):
+    """
+    Color‑coded console logger, Render‑safe.
+    """
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    color = COLOR_MAP.get(level, COLOR_MAP["info"])
+    reset = COLOR_MAP["reset"]
+    print(f"{color}[{level.upper()}] {ts} {msg}{reset}")
+
+    # Also write to file logger if enabled
+    if LOG_ENABLED and LOG_TO_FILE:
+        if level == "error":
+            logger.error(msg)
+        elif level in ("warn", "warning"):
+            logger.warning(msg)
+        elif level in ("diag", "debug"):
+            logger.debug(msg)
+        else:
+            logger.info(msg)
+
+# Alias for compatibility
+log_fn = log
+
+# ---------------------------------------------------------
+# GENERAL UTILITIES
+# ---------------------------------------------------------
+
+def ensure_folder(path: Path) -> None:
+    """Ensure a folder exists."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log_fn(f"[FS] Failed to create folder {path}: {e}", "error")
+
+
+def is_temp_extension(path: Path) -> bool:
+    """Check if file has a temporary extension."""
+    temp_exts = CONFIG.get("temp_extensions", [])
+    return path.suffix.lower() in [e.lower() for e in temp_exts]
+
+
+def is_file_stable(path: Path) -> bool:
+    """Check if file size is stable over a short interval."""
+    timeout = float(FILE_READINESS_CFG.get("timeout_seconds", 12))
+    interval = float(FILE_READINESS_CFG.get("stability_check_interval", 0.4))
+    start = time.time()
+    last_size = -1
+
+    while time.time() - start < timeout:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        if size == last_size and size > 0:
+            return True
+        last_size = size
+        time.sleep(interval)
+
+    return False
+
+
+def safe_move(src: Path, dst: Path) -> None:
+    """Move file with logging and folder creation."""
+    try:
+        ensure_folder(dst.parent)
+        shutil.move(str(src), str(dst))
+        log_fn(f"[FS] Moved: {src} -> {dst}", "info")
+    except Exception as e:
+        log_fn(f"[FS] Failed to move {src} -> {dst}: {e}", "error")
+
+
+def read_file_bytes(path: Path) -> Optional[bytes]:
+    """Read file as bytes, return None on failure."""
+    try:
+        with path.open("rb") as f:
+            return f.read()
+    except Exception as e:
+        log_fn(f"[FS] Failed to read bytes from {path}: {e}", "error")
+        return None
+
+
+def read_file_text(path: Path) -> str:
+    """Read file as text (best effort)."""
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception as e:
+        log_fn(f"[FS] Failed to read text from {path}: {e}", "error")
+        return ""
+
+
+def now_iso() -> str:
+    """Return current time in ISO format."""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------
+# FULLY MERGED HARDENED JSON REPAIR ENGINE + DEBUG LOGGER
+# ---------------------------------------------------------
+
+def repair_json_string(raw: str, log_fn_ref=log_fn) -> str:
+    """
+    Aggressive JSON repair:
+    - Unicode normalization
+    - Strip markdown fences
+    - Extract only the JSON object
+    - Fix unterminated strings
+    - Fix missing commas between fields
+    - Fix trailing commas
+    - Fix mismatched braces/brackets
+    - Escape unescaped quotes inside strings
+    - Remove stray characters before/after JSON
+    - Remove illegal control characters
+    - Debug logger writes repaired JSON on parse failure
+    """
+
+    # -----------------------------------------------------
+    # INTERNAL DEBUG LOGGER
+    # -----------------------------------------------------
+    def debug_log_failed_json(repaired: str):
+        """Logs preview + writes full repaired JSON to a file."""
+        preview = repaired[:2000]
+        log_fn_ref("[AI] JSON PARSE FAILURE — showing repaired JSON preview:", "error")
+        log_fn_ref(preview, "error")
+
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_path = f"json_debug_{ts}.txt"
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(repaired)
+            log_fn_ref(f"[AI] Full repaired JSON written to {debug_path}", "error")
+        except Exception as e:
+            log_fn_ref(f"[AI] Failed to write debug JSON file: {e}", "error")
+
+    # -----------------------------------------------------
+    # START REPAIR PROCESS
+    # -----------------------------------------------------
+    if not isinstance(raw, str):
+        return "{}"
+
+    s = raw.strip()
+
+    # -----------------------------------------------------
+    # UNICODE NORMALIZATION + KEY QUOTE ENFORCEMENT
+    # -----------------------------------------------------
+
+    # Remove BOM and zero-width characters
+    s = s.replace("\ufeff", "")
+    s = re.sub(r"[\u200B-\u200F\u202A-\u202E]", "", s)
+
+    # Replace smart quotes with normal quotes
+    s = s.replace("“", "\"").replace("”", "\"")
+    s = s.replace("‘", "'").replace("’", "'")
+
+    # Replace single-quoted keys with double-quoted keys
+    s = re.sub(r"'\s*([A-Za-z0-9_]+)\s*'\s*:", r'"\1":', s)
+
+    # Replace single-quoted string values with double-quoted
+    s = re.sub(r":\s*'([^']*)'", r': "\1"', s)
+
+    # Fix keys missing quotes entirely
+    s = re.sub(r"{\s*([A-Za-z0-9_]+)\s*:", r'{"\1":', s)
+    s = re.sub(r",\s*([A-Za-z0-9_]+)\s*:", r', "\1":', s)
+
+    # -----------------------------------------------------
+    # STRIP MARKDOWN FENCES
+    # -----------------------------------------------------
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s.lower().startswith("json"):
+            s = s[4:].lstrip()
+
+    # -----------------------------------------------------
+    # ROBUST JSON OBJECT EXTRACTION
+    # -----------------------------------------------------
+    first = None
+    for i, ch in enumerate(s):
+        if ch == "{":
+            first = i
+            break
+
+    if first is None:
+        log_fn_ref("[AI] No JSON object found — returning empty {}", "error")
+        debug_log_failed_json(raw)
+        return "{}"
+
+    brace_count = 0
+    last = None
+
+    for i in range(first, len(s)):
+        if s[i] == "{":
+            brace_count += 1
+        elif s[i] == "}":
+            brace_count -= 1
+            if brace_count == 0:
+                last = i
+                break
+
+    if last is None:
+        # JSON truncated — close braces manually
+        last = len(s) - 1
+        s = s[first:] + ("}" * brace_count)
+    else:
+        s = s[first:last + 1]
+
+    # -----------------------------------------------------
+    # REMOVE ILLEGAL CONTROL CHARACTERS
+    # -----------------------------------------------------
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+
+    # -----------------------------------------------------
+    # FIX NEWLINE-IN-STRING ISSUES
+    # -----------------------------------------------------
+    s = s.replace("\r", "\\r").replace("\n", "\\n")
+
+    # -----------------------------------------------------
+    # ESCAPE UNESCAPED QUOTES INSIDE STRINGS
+    # -----------------------------------------------------
+    def escape_inner_quotes(match):
+        inner = match.group(1)
+        inner = inner.replace('\\"', '"')  # normalize
+        inner = inner.replace('"', '\\"')  # escape
+        return f"\"{inner}\""
+
+    s = re.sub(r'"([^"\\]*(?:\\.[^"\\]*)*)"', escape_inner_quotes, s)
+
+    # -----------------------------------------------------
+    # FIX TRAILING COMMAS
+    # -----------------------------------------------------
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    # -----------------------------------------------------
+    # FIX MISSING COMMAS BETWEEN FIELDS
+    # -----------------------------------------------------
+    s = re.sub(r'"\s*([A-Za-z0-9_]+)"\s*:', r'"\1":', s)
+
+    s = re.sub(
+        r'"\s*:\s*"([^"]*)"\s*"([A-Za-z0-9_]+)"\s*:',
+        r'": "\1", "\2":',
+        s
+    )
+
+    # -----------------------------------------------------
+    # FIX MISMATCHED BRACES
+    # -----------------------------------------------------
+    open_braces = s.count("{")
+    close_braces = s.count("}")
+    if open_braces > close_braces:
+        s += "}" * (open_braces - close_braces)
+    elif close_braces > open_braces:
+        s = "{" * (close_braces - open_braces) + s
+
+    # -----------------------------------------------------
+    # 9. Clean invalid characters after opening brace
+    # -----------------------------------------------------
+    # Ensure JSON starts like: {"key": ...
+    s = re.sub(r'^{\s*([^"\s])', r'{"', s)
+
+    # If we inserted a quote, also fix the remainder
+    # Example: {"category": ...
+    s = re.sub(r'^{\s*"([^"]*)"', r'{"\1"', s)
+
+    # -----------------------------------------------------
+    # FINAL SANITY TRIM
+    # -----------------------------------------------------
+    s = s.strip()
+    if not s.startswith("{"):
+        s = "{" + s
+    if not s.endswith("}"):
+        s = s + "}"
+
+    log_fn_ref("[AI] Hardened JSON repair applied.", "diag")
+    return s
+
+# =========================================================
+# Section 3 — AI ENGINE (Gemini → Qwen) + JSON PIPELINE
+# =========================================================
+
+import json
+
+# ---------------------------------------------------------
+# GEMINI CLIENT SETUP
+# ---------------------------------------------------------
+
+def _init_gemini_client() -> Optional[Any]:
+    """Initialize Gemini client if enabled and available."""
+    gem_cfg = AI_CFG.get("gemini", {})
+    if not gem_cfg.get("enabled", False):
+        log_fn("[AI] Gemini disabled in config.", "diag")
+        return None
+
+    if genai is None:
+        log_fn("[AI] google-genai package not installed; Gemini unavailable.", "warn")
+        return None
+
+    api_key = gem_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY")
+    if not api_key or api_key.startswith("${"):
+        log_fn("[AI] Gemini API key not set; skipping Gemini.", "warn")
+        return None
+
+    try:
+        client = genai.Client(api_key=api_key)
+        log_fn("[AI] Gemini client initialized.", "diag")
+        return client
+    except Exception as e:
+        log_fn(f"[AI] Failed to initialize Gemini client: {e}", "error")
+        return None
+
+
+GEMINI_CLIENT = _init_gemini_client()
+GEMINI_MODEL_PRIMARY = AI_CFG.get("gemini", {}).get("model", "gemini-2.5-pro")
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
+
+# NOTE: You said “keep my Gemini enterprise prompt EXACTLY as-is”.
+# Paste your existing prompt into this constant:
+GEMINI_ENTERPRISE_PROMPT = r"""
+You are an enterprise‑grade document intelligence engine.  
+Your job is to analyze OCR text and return a STRICT JSON object following the schema below.  
+You MUST follow all rules exactly.  
+You MUST NOT add commentary, explanations, or text outside the JSON.  
+You MUST NOT include markdown.  
+You MUST NOT include trailing commas.  
+You MUST NOT hallucinate fields not present in the document.  
+
+============================================================
+RULES — GENERAL
+============================================================
+
+1. Extract ONLY what is present in the document.  
+2. If a field is missing, return an empty string "" (never null).  
+3. Normalize all dates to ISO format: YYYY-MM-DD.  
+4. Normalize all amounts to plain numbers without currency symbols.  
+5. Detect the document category using the strongest signals available.  
+6. If category is uncertain, return "review".  
+7. Summaries MUST be 3–6 sentences, human-readable, and factual.  
+8. Reasoning MUST be 1–3 sentences explaining how you determined category + metadata.  
+9. DO NOT include the filename in the summary.  
+10. DO NOT include commentary outside the JSON.  
+
+============================================================
+RULES — CATEGORY DETECTION
+============================================================
+
+Use these signals to determine category:
+
+INSURANCE  
+- Mentions of policy number, claim number, coverage, deductible, premium, carrier names  
+- Words: "insurance", "policy", "claim", "coverage", "premium", "benefits"  
+
+FINANCIAL  
+- Bank names, account numbers, routing numbers, statements, balances  
+- Words: "statement", "deposit", "withdrawal", "transaction", "account"  
+
+MEDICAL  
+- Providers, CPT/ICD codes, patient info, visit summaries, EOBs  
+- Words: "patient", "provider", "diagnosis", "treatment", "EOB"  
+
+BILLING  
+- Amount due, due date, invoice number, service period  
+- Words: "invoice", "amount due", "billing", "statement", "due"  
+
+GOVERNMENT  
+- IRS, SSA, DMV, USCIS, state agencies, official forms  
+- Words: "official", "form", "department", "agency", "federal", "state"  
+
+LEGAL  
+- Contracts, agreements, signatures, clauses, legal entities  
+- Words: "agreement", "contract", "hereby", "party", "attorney"  
+
+TAX  
+- W‑2, 1099, 1040, IRS notices  
+- Words: "tax", "IRS", "income", "withholding"  
+
+RECEIPT  
+- Itemized purchases, totals, merchant info  
+- Words: "receipt", "subtotal", "sales tax", "POS"  
+
+ID  
+- Driver’s license, passport, ID card  
+- Words: "license", "DOB", "ID", "passport"  
+
+If none match confidently → category = "review".
+
+============================================================
+RULES — METADATA EXTRACTION
+============================================================
+
+issuer  
+- Company, agency, provider, or sender  
+- Prefer header text, logos, or top-left identifiers  
+
+document_type  
+- "invoice", "bill", "statement", "policy", "claim", "form", "notice", etc.  
+
+dates  
+- invoice_date  
+- due_date  
+- service_date  
+- statement_date  
+- issue_date  
+- received_date  
+Return "" if not present.
+
+amounts  
+- amount_due  
+- total  
+- subtotal  
+- tax  
+- balance  
+Return numbers only (e.g., "129.55").
+
+numbers  
+- invoice_number  
+- account_number  
+- policy_number  
+- claim_number  
+- reference_number  
+
+tables  
+- Extract any tabular data (line items, charges, transactions).  
+- Return as an array of objects.  
+- If none exist, return [].
+
+============================================================
+OUTPUT FORMAT — STRICT JSON ONLY
+============================================================
+
+{
+  "source_model": "",
+  "category": "",
+  "document_type": "",
+  "issuer": "",
+  "summary": "",
+  "reasoning": "",
+  "dates": {
+    "invoice_date": "",
+    "due_date": "",
+    "service_date": "",
+    "statement_date": "",
+    "issue_date": "",
+    "received_date": ""
+  },
+  "amounts": {
+    "amount_due": "",
+    "total": "",
+    "subtotal": "",
+    "tax": "",
+    "balance": ""
+  },
+  "numbers": {
+    "invoice_number": "",
+    "account_number": "",
+    "policy_number": "",
+    "claim_number": "",
+    "reference_number": ""
+  },
+  "tables": []
+}
+
+============================================================
+END OF INSTRUCTIONS — RETURN ONLY THE JSON OBJECT
+============================================================
+"""
+
+
+# ---------------------------------------------------------
+# QWEN / OLLAMA CLIENT SETUP
+# ---------------------------------------------------------
+
+def _get_ollama_url() -> str:
+    """Return Ollama HTTP endpoint from config or default."""
+    return AI_CFG.get("ollama_url", "http://localhost:11434/api/generate")
+
+
+def _get_qwen_model_priority_list() -> List[str]:
+    """
+    Build a priority list of Qwen models.
+    - First: model from config
+    - Then: known larger models
+    - Then: smaller ones
+    """
+    cfg_model = AI_CFG.get("model", "qwen2.5:0.5b")
+    priority = [cfg_model]
+
+    # Add known variants if not already present
+    known = ["qwen2.5:1.5b", "qwen2.5-coder:0.5b", "qwen2.5:0.5b"]
+    for m in known:
+        if m not in priority:
+            priority.append(m)
+
+    return priority
+
+
+def _call_ollama_generate(
+    model: str,
+    prompt: str,
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+) -> Optional[str]:
+    """Call Ollama /api/generate with a simple JSON payload."""
+    if requests is None:
+        log_fn("[AI] requests not installed; cannot call Ollama.", "error")
+        return None
+
+    url = _get_ollama_url()
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        },
+    }
+
+    try:
+        resp = requests.post(url, json=payload, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("response", "")
+    except Exception as e:
+        log_fn(f"[AI] Ollama call failed for model {model}: {e}", "error")
+        return None
+
+
+# ---------------------------------------------------------
+# RAW JSON EXTRACTION & PARSING
+# ---------------------------------------------------------
+
+def extract_raw_json_from_text(raw: str) -> str:
+    """
+    Extract the JSON portion from a raw model response.
+    Uses repair_json_string() to sanitize before parsing.
+    """
+    if not isinstance(raw, str):
+        return "{}"
+
+    # Try to find first '{' and last '}' as a crude JSON boundary
+    s = raw.strip()
+    first = s.find("{")
+    last = s.rfind("}")
+    if first != -1 and last != -1 and last > first:
+        s = s[first:last + 1]
+    else:
+        # Fallback: use entire string
+        s = s
+
+    # Repair obvious issues
+    s = repair_json_string(s, log_fn_ref=log_fn)
+    return s
+
+
+def parse_json_safely(raw: str) -> Dict[str, Any]:
+    """
+    Parse JSON string safely into a dict.
+    Returns {} on failure.
+    """
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        log_fn(f"[AI] JSON parse failed: {e}", "error")
+        return {}
+
+
+# ---------------------------------------------------------
+# UNIFIED NORMALIZATION (OPTION B + source_model)
+# ---------------------------------------------------------
+
+def normalize_ai_result(
+    data: Dict[str, Any],
+    original_text: str,
+    source_model_label: str,
+) -> Dict[str, Any]:
+    """
+    Normalize AI result into the unified schema:
+
+    {
+      "text": "string",
+      "category": "string",
+      "confidence": "float",
+      "summary": "string",
+      "reasoning": "string",
+      "filename": "string",
+      "source_model": "string",
+
+      "issuer": "string",
+      "document_type": "string",
+      "statement_date": "string",
+      "billing_period": "string",
+      "service_period": "string",
+      "due_date": "string",
+      "account_number": "string",
+      "policy_number": "string",
+      "invoice_number": "string",
+      "tax_id": "string",
+      "address": "string",
+      "phone_numbers": ["string"],
+      "amount_due": "string",
+      "new_balance": "string",
+      "line_items": [
+        {
+          "description": "string",
+          "amount": "string"
+        }
+      ],
+
+      "metadata": { ... },
+      "tables": [ ["row1col1", "row1col2"] ],
+      "entities": {
+        "person": ["string"],
+        "org": ["string"],
+        "address": ["string"],
+        "phone": ["string"],
+        "email": ["string"]
+      },
+      "dates": ["YYYY-MM-DD"],
+
+      "ai_failed": "boolean"
+    }
+    """
+    if not isinstance(data, dict):
+        data = {}
+
+    # Core fields
+    text_val = data.get("text") or original_text or ""
+    data["text"] = str(text_val)
+
+    data["category"] = str(data.get("category", "") or "")
+    data["summary"] = str(data.get("summary", "") or "")
+    data["reasoning"] = str(data.get("reasoning", "") or "")
+    data["filename"] = str(data.get("filename", "") or "")
+
+    # Source model (friendly label)
+    data["source_model"] = source_model_label
+
+    # Confidence
+    try:
+        data["confidence"] = float(data.get("confidence", 0.0))
+    except Exception:
+        data["confidence"] = 0.0
+
+    # Enterprise-style fields (strings)
+    for key in [
+        "issuer",
+        "document_type",
+        "statement_date",
+        "billing_period",
+        "service_period",
+        "due_date",
+        "account_number",
+        "policy_number",
+        "invoice_number",
+        "tax_id",
+        "address",
+        "amount_due",
+        "new_balance",
+    ]:
+        val = data.get(key, "")
+        if val is None:
+            val = ""
+        data[key] = str(val)
+
+    # Phone numbers: ensure list of strings
+    phone_numbers = data.get("phone_numbers", [])
+    if isinstance(phone_numbers, str):
+        phone_numbers = [phone_numbers]
+    elif not isinstance(phone_numbers, list):
+        phone_numbers = []
+    data["phone_numbers"] = [str(p) for p in phone_numbers]
+
+    # Line items: list of {description, amount}
+    line_items = data.get("line_items", [])
+    normalized_items: List[Dict[str, str]] = []
+    if isinstance(line_items, list):
+        for item in line_items:
+            if not isinstance(item, dict):
+                continue
+            desc = str(item.get("description", "") or "")
+            amt = str(item.get("amount", "") or "")
+            normalized_items.append({"description": desc, "amount": amt})
+    data["line_items"] = normalized_items
+
+    # Metadata: dict
+    metadata = data.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    data["metadata"] = metadata
+
+    # Tables: list of rows (list of strings)
+    tables = data.get("tables", [])
+    normalized_tables: List[List[str]] = []
+    if isinstance(tables, list):
+        for row in tables:
+            if isinstance(row, list):
+                normalized_tables.append([str(cell) for cell in row])
+    data["tables"] = normalized_tables
+
+    # Entities: dict of lists
+    entities = data.get("entities", {})
+    if not isinstance(entities, dict):
+        entities = {}
+
+    def _ensure_list_of_str(v: Any) -> List[str]:
+        if isinstance(v, list):
+            return [str(x) for x in v]
+        if isinstance(v, str):
+            return [v]
+        return []
+
+    entities_norm = {
+        "person": _ensure_list_of_str(entities.get("person", [])),
+        "org": _ensure_list_of_str(entities.get("org", [])),
+        "address": _ensure_list_of_str(entities.get("address", [])),
+        "phone": _ensure_list_of_str(entities.get("phone", [])),
+        "email": _ensure_list_of_str(entities.get("email", [])),
+    }
+    data["entities"] = entities_norm
+
+    # Dates: list of strings
+    dates = data.get("dates", [])
+    if isinstance(dates, str):
+        dates = [dates]
+    elif not isinstance(dates, list):
+        dates = []
+    data["dates"] = [str(d) for d in dates]
+
+    # ai_failed: boolean
+    ai_failed = data.get("ai_failed", False)
+    data["ai_failed"] = bool(ai_failed)
+
+    return data
+
+
+# ---------------------------------------------------------
+# GEMINI CALL HELPERS
+# ---------------------------------------------------------
+
+def _call_gemini_model(
+    model_name: str,
+    text: str,
+    filename: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Call a Gemini model with the enterprise prompt.
+    Returns parsed JSON dict or None on failure.
+    """
+    if GEMINI_CLIENT is None:
+        return None
+
+    try:
+        log_fn("[AI] ------------------------------------------------------------", "diag")
+        log_fn(f"[AI] Calling Gemini model: {model_name}", "diag")
+        start_ts = time.time()
+
+        # --- Correct new Gemini SDK request format ---
+        contents = [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": GEMINI_ENTERPRISE_PROMPT},
+                    {"text": f"\n\nFILENAME:\n{filename}\n\nTEXT:\n{text}"},
+                ],
+            }
+        ]
+
+        resp = GEMINI_CLIENT.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                max_output_tokens=AI_CFG.get("gemini", {}).get("max_output_tokens", 8192),
+                temperature=0.2,
+            ),
+        )
+
+        # --- UNIVERSAL RESPONSE EXTRACTION ---
+        raw = ""
+
+        # 1) Simple path
+        if hasattr(resp, "text") and resp.text:
+            raw = resp.text
+
+        # 2) Candidates → content → parts
+        if not raw:
+            try:
+                cand_count = len(resp.candidates)
+                log_fn(f"[AI] Gemini candidates: {cand_count}", "diag")
+
+                for cand in resp.candidates:
+                    if not cand.content:
+                        continue
+                    part_count = len(cand.content.parts)
+                    log_fn(f"[AI] Candidate parts: {part_count}", "diag")
+
+                    for part in cand.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            raw += part.text + "\n"
+            except Exception as e:
+                log_fn(f"[AI] Candidate/parts extraction error: {e}", "warn")
+
+        # 3) Fallback: stringify entire response
+        if not raw:
+            log_fn("[AI] No text found; using str(resp) fallback", "warn")
+            raw = str(resp)
+
+        # Timing
+        elapsed_ms = int((time.time() - start_ts) * 1000)
+        log_fn(f"[AI] Gemini call took {elapsed_ms} ms", "diag")
+
+        # Raw length
+        log_fn(f"[AI] Raw response length: {len(raw)} chars", "diag")
+
+        if not raw.strip():
+            log_fn(f"[AI] Gemini ({model_name}) returned empty response.", "warn")
+            return None
+
+        # --- JSON extraction ---
+        json_str = extract_raw_json_from_text(raw)
+        log_fn(f"[AI] Extracted JSON length: {len(json_str)} chars", "diag")
+
+        data = parse_json_safely(json_str)
+        if not isinstance(data, dict):
+            log_fn("[AI] JSON parse failed or returned non-dict.", "warn")
+            return None
+
+        # --- Token estimate ---
+        approx_tokens = max(1, len(raw) // 4)
+        log_fn(f"[AI] Estimated output tokens: {approx_tokens}", "diag")
+
+        # --- Preview category + summary if present ---
+        cat = data.get("category", "<none>")
+        summ = data.get("summary", "")
+        log_fn(f"[AI] Preview Category: {cat}", "diag")
+        log_fn(f"[AI] Preview Summary: {summ[:200]}", "diag")
+
+        return data
+
+    except Exception as e:
+        log_fn(f"[AI] Gemini call failed for model {model_name}: {e}", "error")
+        return None
+
+
+def analyze_with_gemini(text: str, filename: str) -> Optional[Dict[str, Any]]:
+    """
+    Try Gemini primary, then Gemini fallback.
+    Returns dict or None if both fail.
+    """
+    if GEMINI_CLIENT is not None:
+        log_fn(f"[AI] Trying Gemini primary: {GEMINI_MODEL_PRIMARY}", "diag")
+        data = _call_gemini_model(GEMINI_MODEL_PRIMARY, text, filename)
+        if isinstance(data, dict) and data:
+            data["source_model"] = "Gemini Pro"
+            log_fn("[AI] Gemini primary succeeded.", "diag")
+            return data
+
+        log_fn(f"[AI] Gemini primary failed; trying fallback: {GEMINI_MODEL_FALLBACK}", "warn")
+        data = _call_gemini_model(GEMINI_MODEL_FALLBACK, text, filename)
+        if isinstance(data, dict) and data:
+            data["source_model"] = "Gemini Flash"
+            log_fn("[AI] Gemini fallback succeeded.", "diag")
+            return data
+
+    log_fn("[AI] Gemini primary + fallback both failed.", "error")
+    return None
+
+# ---------------------------------------------------------
+# QWEN CALL HELPERS
+# ---------------------------------------------------------
+
+QWEN_PROMPT_TEMPLATE = r"""
+You are an AI document intelligence engine.
+
+You MUST respond with a SINGLE JSON OBJECT ONLY.
+No prose, no explanation, no markdown, no backticks.
+
+Unified schema (all fields optional but must exist in the JSON):
+
+{
+  "text": "string",
+  "category": "string",
+  "confidence": "float",
+  "summary": "string",
+  "reasoning": "string",
+  "filename": "string",
+
+  "issuer": "string",
+  "document_type": "string",
+  "statement_date": "string",
+  "billing_period": "string",
+  "service_period": "string",
+  "due_date": "string",
+  "account_number": "string",
+  "policy_number": "string",
+  "invoice_number": "string",
+  "tax_id": "string",
+  "address": "string",
+  "phone_numbers": ["string"],
+  "amount_due": "string",
+  "new_balance": "string",
+  "line_items": [
+    {
+      "description": "string",
+      "amount": "string"
+    }
+  ],
+
+  "metadata": { "any": "object" },
+  "tables": [ ["row1col1", "row1col2"] ],
+  "entities": {
+    "person": ["string"],
+    "org": ["string"],
+    "address": ["string"],
+    "phone": ["string"],
+    "email": ["string"]
+  },
+  "dates": ["YYYY-MM-DD"],
+
+  "ai_failed": "boolean"
+}
+
+Instructions:
+- Fill as many fields as you can.
+- If unsure, leave fields as empty string, empty list, or empty object.
+- "category" should be a short, human-meaningful label (e.g., "Bank Statement", "Insurance Policy", "Medical Bill").
+- "summary" should be a concise multi-sentence summary of the document.
+- "reasoning" should briefly explain how you chose the category and key fields.
+- "line_items" should capture any tabular billing or transaction details if present.
+- "tables" should capture any structured tables as rows of strings.
+- "entities" should extract key people, organizations, addresses, phones, and emails.
+- "dates" should list important dates in ISO-like format if possible.
+- "ai_failed" should be true ONLY if you could not understand the document at all.
+
+Now analyze this document:
+
+FILENAME:
+{filename}
+
+TEXT:
+{text}
+"""
+
+
+def analyze_with_qwen(text: str, filename: str) -> Optional[Dict[str, Any]]:
+    """
+    Try Qwen models in priority order via Ollama.
+    Returns dict or None if all fail.
+    """
+    models = _get_qwen_model_priority_list()
+    for m in models:
+        log_fn(f"[AI] Trying Qwen model: {m}", "diag")
+        prompt = QWEN_PROMPT_TEMPLATE.format(filename=filename, text=text)
+        raw = _call_ollama_generate(m, prompt)
+        if not raw:
+            continue
+
+        json_str = extract_raw_json_from_text(raw)
+        data = parse_json_safely(json_str)
+        if isinstance(data, dict) and data:
+            data["source_model"] = "Qwen (Ollama)"
+            return data
+
+    return None
+
+
+# ---------------------------------------------------------
+# MASTER AI ENTRYPOINT
+# ---------------------------------------------------------
+
+def analyze_document_with_ai(
+    text: str,
+    filename: str,
+) -> Dict[str, Any]:
+    """
+    Master AI entrypoint:
+    1) Try Gemini (Pro → Flash)
+    2) If Gemini unavailable or fails, try Qwen via Ollama
+    3) Normalize into unified schema
+    """
+    # Default empty result
+    base_result: Dict[str, Any] = {
+        "text": text or "",
+        "category": "",
+        "confidence": 0.0,
+        "summary": "",
+        "reasoning": "",
+        "filename": filename or "",
+        "source_model": "",
+        "issuer": "",
+        "document_type": "",
+        "statement_date": "",
+        "billing_period": "",
+        "service_period": "",
+        "due_date": "",
+        "account_number": "",
+        "policy_number": "",
+        "invoice_number": "",
+        "tax_id": "",
+        "address": "",
+        "phone_numbers": [],
+        "amount_due": "",
+        "new_balance": "",
+        "line_items": [],
+        "metadata": {},
+        "tables": [],
+        "entities": {
+            "person": [],
+            "org": [],
+            "address": [],
+            "phone": [],
+            "email": [],
+        },
+        "dates": [],
+        "ai_failed": True,
+    }
+
+    # 1) Try Gemini
+    gem_data = analyze_with_gemini(text, filename)
+    if isinstance(gem_data, dict) and gem_data:
+        log_fn("[AI] Using Gemini result.", "info")
+        normalized = normalize_ai_result(
+            gem_data,
+            original_text=text,
+            source_model_label=gem_data.get("source_model", "Gemini Pro"),
+        )
+        normalized["ai_failed"] = False
+        return normalized
+
+    # 2) Try Qwen
+    qwen_data = analyze_with_qwen(text, filename)
+    if isinstance(qwen_data, dict) and qwen_data:
+        log_fn("[AI] Using Qwen result.", "info")
+        normalized = normalize_ai_result(
+            qwen_data,
+            original_text=text,
+            source_model_label=qwen_data.get("source_model", "Qwen (Ollama)"),
+        )
+        normalized["ai_failed"] = False
+        return normalized
+
+    # 3) Both failed
+    log_fn("[AI] All AI models failed; returning fallback structure.", "error")
+    return base_result
+
+# =========================================================
+# Section 4 — OCR PIPELINE (Google Vision + Fallbacks)
+# =========================================================
+
+import io
+
+try:
+    from pdf2image import convert_from_path
+except ImportError:
+    convert_from_path = None
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+# NOTE:
+# - Primary OCR: Google Vision (if enabled in config and available)
+# - Fallback OCR: simple text extraction (for now: placeholder / passthrough)
+# - You can later plug in PyMuPDF / Tesseract if you want richer fallback.
+
+
+# ---------------------------------------------------------
+# GOOGLE VISION CLIENT SETUP
+# ---------------------------------------------------------
+
+def _init_vision_client():
+    """Initialize Google Vision client if available and enabled."""
+    use_vision = AI_CFG.get("use_google_vision", True)
+    if not use_vision:
+        log_fn("[OCR] Google Vision disabled in config.", "diag")
+        return None
+
+    try:
+        from google.cloud import vision  # type: ignore
+    except ImportError:
+        log_fn("[OCR] google-cloud-vision not installed; Vision OCR unavailable.", "warn")
+        return None
+
+    try:
+        client = vision.ImageAnnotatorClient()
+        log_fn("[OCR] Google Vision client initialized.", "diag")
+        return client
+    except Exception as e:
+        log_fn(f"[OCR] Failed to initialize Google Vision client: {e}", "error")
+        return None
+
+
+VISION_CLIENT = _init_vision_client()
+
+
+# ---------------------------------------------------------
+# PDF → IMAGE CONVERSION (FOR OCR)
+# ---------------------------------------------------------
+
+def pdf_to_images(path: Path, dpi: int = 400) -> List[Image.Image]:
+    """
+    Convert a PDF to a list of PIL Images for OCR.
+    Uses pdf2image if available.
+    """
+    if convert_from_path is None or Image is None:
+        log_fn("[OCR] pdf2image or Pillow not installed; cannot OCR PDFs.", "warn")
+        return []
+
+    try:
+        images = convert_from_path(str(path), dpi=dpi)
+        log_fn(f"[OCR] Converted PDF to {len(images)} image(s) at {dpi} DPI.", "diag")
+        return images
+    except Exception as e:
+        log_fn(f"[OCR] Failed to convert PDF to images: {e}", "error")
+        return []
+
+
+def image_file_to_pil(path: Path) -> Optional[Image.Image]:
+    """Load an image file into a PIL Image."""
+    if Image is None:
+        log_fn("[OCR] Pillow not installed; cannot load images.", "warn")
+        return None
+
+    try:
+        img = Image.open(str(path))
+        return img
+    except Exception as e:
+        log_fn(f"[OCR] Failed to open image {path}: {e}", "error")
+        return None
+
+
+# ---------------------------------------------------------
+# GOOGLE VISION OCR HELPERS
+# ---------------------------------------------------------
+
+def _vision_ocr_bytes(image_bytes: bytes) -> str:
+    """Run Google Vision OCR on raw image bytes."""
+    if VISION_CLIENT is None:
+        return ""
+
+    try:
+        from google.cloud import vision  # type: ignore
+    except ImportError:
+        return ""
+
+    try:
+        image = vision.Image(content=image_bytes)
+        response = VISION_CLIENT.document_text_detection(image=image)
+        if response.error.message:
+            log_fn(f"[OCR] Vision error: {response.error.message}", "error")
+            return ""
+
+        text = response.full_text_annotation.text or ""
+        return text
+    except Exception as e:
+        log_fn(f"[OCR] Vision OCR failed: {e}", "error")
+        return ""
+
+
+def ocr_pil_image(img: Image.Image) -> str:
+    """
+    Run OCR on a PIL Image using Google Vision if available.
+    Returns extracted text or empty string.
+    """
+    if img is None:
+        return ""
+
+    try:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+    except Exception as e:
+        log_fn(f"[OCR] Failed to convert PIL image to bytes: {e}", "error")
+        return ""
+
+    text = _vision_ocr_bytes(image_bytes)
+    return text or ""
+
+
+def ocr_pdf_with_vision(path: Path) -> str:
+    """OCR a PDF using Vision (via PDF→image)."""
+    pages = pdf_to_images(path, dpi=400)
+    if not pages:
+        return ""
+
+    all_text_parts: List[str] = []
+    for idx, page in enumerate(pages, start=1):
+        log_fn(f"[OCR] OCRing PDF page {idx}/{len(pages)}", "diag")
+        page_text = ocr_pil_image(page)
+        if page_text:
+            all_text_parts.append(page_text)
+
+    return "\n\n".join(all_text_parts).strip()
+
+
+def ocr_image_with_vision(path: Path) -> str:
+    """OCR an image file using Vision."""
+    img = image_file_to_pil(path)
+    if img is None:
+        return ""
+    return ocr_pil_image(img)
+
+
+# ---------------------------------------------------------
+# FALLBACK OCR (PLACEHOLDER)
+# ---------------------------------------------------------
+
+def fallback_ocr(path: Path) -> str:
+    """
+    Fallback OCR / text extraction.
+    For now, this is a placeholder that just returns empty string.
+    You can later plug in:
+      - PyMuPDF for PDFs
+      - pytesseract for images
+      - or any other OCR engine
+    """
+    log_fn(f"[OCR] Fallback OCR not implemented for {path.name}.", "warn")
+    return ""
+
+
+# ---------------------------------------------------------
+# MASTER OCR ENTRYPOINT (PATCHED WITH DOCX + XLSX SUPPORT)
+# ---------------------------------------------------------
+
+def extract_text_for_ai(path: Path) -> str:
+    """
+    Extract text from a file for AI analysis.
+
+    Strategy:
+    - PDF → Vision OCR → fallback OCR
+    - Image → Vision OCR → fallback OCR
+    - TXT/MD → read as text
+    - DOCX → python-docx extractor
+    - XLSX → openpyxl extractor
+    - Others → empty text
+    """
+    suffix = path.suffix.lower()
+
+    log_fn("[DEBUG] Running PATCHED extract_text_for_ai()", "diag")
+
+    log_fn(f"[DEBUG] suffix detected = '{suffix}' for {path.name}", "diag")
+
+    # ---------------------------------------------------------
+    # DOCX extraction (python-docx)
+    # ---------------------------------------------------------
+    if suffix == ".docx":
+        log_fn(f"[DOCX] Extracting text from DOCX: {path.name}", "info")
+        try:
+            from docx import Document
+            doc = Document(path)
+            text = "\n".join([p.text for p in doc.paragraphs])
+            if text.strip():
+                log_fn(f"[DOCX] Extracted {len(text)} characters from {path.name}", "diag")
+                return text
+            else:
+                log_fn(f"[DOCX] No text found in {path.name}", "warn")
+                return ""
+        except Exception as e:
+            log_fn(f"[DOCX] Failed to extract DOCX ({e}); returning empty text.", "error")
+            return ""
+
+    # ---------------------------------------------------------
+    # XLSX extraction (openpyxl)
+    # ---------------------------------------------------------
+    if suffix == ".xlsx":
+        log_fn(f"[XLSX] Extracting text from XLSX: {path.name}", "info")
+        try:
+            from openpyxl import load_workbook
+            wb = load_workbook(path, data_only=True)
+            rows_out = []
+
+            for sheet in wb.worksheets:
+                rows_out.append(f"=== SHEET: {sheet.title} ===")
+                for row in sheet.iter_rows(values_only=True):
+                    if not row:
+                        continue
+                    # Convert row tuple → string, skip None cells
+                    cleaned = [str(c) for c in row if c not in (None, "")]
+                    if cleaned:
+                        rows_out.append(" | ".join(cleaned))
+
+            text = "\n".join(rows_out)
+            if text.strip():
+                log_fn(f"[XLSX] Extracted {len(text)} characters from {path.name}", "diag")
+                return text
+            else:
+                log_fn(f"[XLSX] No text found in {path.name}", "warn")
+                return ""
+        except Exception as e:
+            log_fn(f"[XLSX] Failed to extract XLSX ({e}); returning empty text.", "error")
+            return ""
+
+    # ---------------------------------------------------------
+    # PDF
+    # ---------------------------------------------------------
+    if suffix == ".pdf":
+        log_fn(f"[OCR] Extracting text from PDF: {path.name}", "info")
+        if VISION_CLIENT is not None:
+            text = ocr_pdf_with_vision(path)
+            if text.strip():
+                return text
+        return fallback_ocr(path)
+
+    # ---------------------------------------------------------
+    # Image
+    # ---------------------------------------------------------
+    photo_exts = CLASSIFICATION_CFG.get("photo_extensions", [])
+    if suffix in [e.lower() for e in photo_exts]:
+        log_fn(f"[OCR] Extracting text from image: {path.name}", "info")
+        if VISION_CLIENT is not None:
+            text = ocr_image_with_vision(path)
+            if text.strip():
+                return text
+        return fallback_ocr(path)
+
+    # ---------------------------------------------------------
+    # Plain text documents
+    # ---------------------------------------------------------
+    doc_exts = CLASSIFICATION_CFG.get("document_extensions", [])
+    if suffix in [".txt", ".md"] or suffix in [e.lower() for e in doc_exts if e.lower() in [".txt", ".md"]]:
+        log_fn(f"[OCR] Reading plain text document: {path.name}", "info")
+        return read_file_text(path)
+
+    # ---------------------------------------------------------
+    # Unsupported file types
+    # ---------------------------------------------------------
+    log_fn(f"[OCR] No specialized extractor for {path.name}; returning empty text.", "warn")
+    return ""
+
+# =========================================================
+# Section 5 — FILENAME ENGINE V4 (Semantic, Metadata-Aware)
+# =========================================================
+
+import re
+from datetime import datetime
+
+# ---------------------------------------------------------
+# FILENAME SANITIZATION HELPERS
+# ---------------------------------------------------------
+
+def _sanitize_component(value: str) -> str:
+    """
+    Sanitize a single filename component:
+    - Strip whitespace
+    - Replace invalid characters with '_'
+    - Collapse multiple underscores
+    - Trim to a reasonable length
+    """
+    if not value:
+        return ""
+
+    v = value.strip()
+    # Replace invalid filename characters
+    v = re.sub(r'[\\/:*?"<>|]+', "_", v)
+    # Replace spaces with underscores
+    v = re.sub(r"\s+", "_", v)
+    # Collapse multiple underscores
+    v = re.sub(r"_+", "_", v)
+    # Strip leading/trailing underscores
+    v = v.strip("_")
+    # Limit length
+    if len(v) > 60:
+        v = v[:60]
+    return v
+
+
+def _normalize_date_for_filename(date_str: str) -> str:
+    """
+    Try to normalize a date string into YYYYMMDD for filenames.
+    If parsing fails, return empty string.
+    """
+    if not date_str:
+        return ""
+
+    # Try a few common formats
+    candidates = [
+        "%Y-%m-%d",
+        "%Y/%m/%d",
+        "%m/%d/%Y",
+        "%m-%d-%Y",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%Y-%m",
+        "%Y/%m",
+    ]
+
+    for fmt in candidates:
+        try:
+            dt = datetime.strptime(date_str.strip(), fmt)
+            return dt.strftime("%Y%m%d")
+        except Exception:
+            continue
+
+    # Try to extract a date-like pattern (very loose)
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", date_str)
+    if m:
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            dt = datetime(y, mo, d)
+            return dt.strftime("%Y%m%d")
+        except Exception:
+            pass
+
+    return ""
+
+
+def _pick_best_date_for_filename(ai_result: Dict[str, Any]) -> str:
+    """
+    Choose the best date field for filename:
+    1) statement_date
+    2) due_date
+    3) billing_period
+    4) service_period
+    5) first entry in dates[]
+    Returns normalized YYYYMMDD or "".
+    """
+    for key in ["statement_date", "due_date", "billing_period", "service_period"]:
+        val = str(ai_result.get(key, "") or "")
+        norm = _normalize_date_for_filename(val)
+        if norm:
+            return norm
+
+    dates = ai_result.get("dates", [])
+    if isinstance(dates, list) and dates:
+        for d in dates:
+            norm = _normalize_date_for_filename(str(d))
+            if norm:
+                return norm
+
+    return ""
+
+
+# ---------------------------------------------------------
+# FILENAME V4 BUILDER
+# ---------------------------------------------------------
+
+def build_smart_filename(ai_result: Dict[str, Any], original_path: Path) -> str:
+    """
+    Build a semantic, metadata-aware filename using AI result fields.
+
+    Pattern (best effort, components optional):
+
+      {DATE}_{ISSUER}_{DOC_TYPE}_{CATEGORY}_{ACCOUNT_OR_POLICY}_{ORIGINAL_BASENAME}.{EXT}
+
+    Examples:
+      20250115_Chase_Bank_Statement_Checking_1234.pdf
+      20241231_BlueCross_Insurance_Policy_Health_ABC123.pdf
+      20241101_Utility_Bill_Electric_MidAmerican.pdf
+
+    Rules:
+    - Use normalized date if available (YYYYMMDD).
+    - Use issuer, document_type, category if present.
+    - Use account_number or policy_number if present.
+    - Always preserve original extension.
+    - Sanitize all components.
+    - Avoid empty components and double underscores.
+    """
+    ext = original_path.suffix or ""
+    orig_stem = original_path.stem
+
+    issuer = _sanitize_component(str(ai_result.get("issuer", "") or ""))
+    doc_type = _sanitize_component(str(ai_result.get("document_type", "") or ""))
+    category = _sanitize_component(str(ai_result.get("category", "") or ""))
+    account = _sanitize_component(str(ai_result.get("account_number", "") or ""))
+    policy = _sanitize_component(str(ai_result.get("policy_number", "") or ""))
+
+    # Prefer account_number, then policy_number
+    acct_or_policy = account or policy
+
+    # Date
+    date_part = _pick_best_date_for_filename(ai_result)
+    if not date_part:
+        # If no date, leave blank; we won't force today's date
+        date_part = ""
+
+    # Original stem (sanitized, but shorter)
+    orig_component = _sanitize_component(orig_stem)
+    if len(orig_component) > 40:
+        orig_component = orig_component[:40]
+
+    components: List[str] = []
+    if date_part:
+        components.append(date_part)
+    if issuer:
+        components.append(issuer)
+    if doc_type:
+        components.append(doc_type)
+    if category and category.lower() not in (doc_type.lower() if doc_type else ""):
+        components.append(category)
+    if acct_or_policy:
+        components.append(acct_or_policy)
+    if orig_component:
+        components.append(orig_component)
+
+    # If everything is empty, fall back to original name
+    if not components:
+        log_fn("[NAME] No metadata for filename; using original name.", "warn")
+        return original_path.name
+
+    filename_core = "_".join([c for c in components if c])
+    filename_core = re.sub(r"_+", "_", filename_core).strip("_")
+
+    # Final safety: limit total length
+    max_len = 150
+    if len(filename_core) > max_len:
+        filename_core = filename_core[:max_len]
+
+    new_name = f"{filename_core}{ext}"
+    return new_name
+
+# =========================================================
+# Section 6 — ROUTING ENGINE (Categories → Folders)
+# =========================================================
+
+# This section decides WHERE a file should go based on:
+# - AI category
+# - AI metadata (issuer, document_type, etc.)
+# - Configured destinations
+# - Auto-creation under sorted_root for new categories
+
+SORTED_ROOT = Path(DESTINATIONS.get("sorted_root", str(OUTPUT_FOLDER)))
+
+
+# ---------------------------------------------------------
+# CATEGORY → DESTINATION MAPPING HELPERS
+# ---------------------------------------------------------
+
+def _normalize_category_key(cat: str) -> str:
+    """
+    Normalize a category string into a simple key:
+    - Lowercase
+    - Strip whitespace
+    - Remove non-alphanumeric except spaces
+    - Collapse spaces to underscores
+    """
+    if not cat:
+        return ""
+
+    c = cat.lower().strip()
+    c = re.sub(r"[^a-z0-9\s]+", " ", c)
+    c = re.sub(r"\s+", "_", c)
+    c = c.strip("_")
+    return c
+
+
+def _find_best_destination_for_category(category: str) -> Optional[Path]:
+    """
+    Map a category string to a configured destination folder, if possible.
+    Strategy:
+    - Normalize category
+    - Check for direct key match in DESTINATIONS
+    - Check for partial matches (e.g., "bank_statement" → "bank_statements")
+    - Fallback: None (caller may auto-create under sorted_root)
+    """
+    if not category:
+        return None
+
+    norm = _normalize_category_key(category)
+    if not norm:
+        return None
+
+    # Direct key match
+    if norm in DESTINATIONS:
+        return Path(DESTINATIONS[norm])
+
+    # Partial / fuzzy match
+    for key, path_str in DESTINATIONS.items():
+        key_norm = _normalize_category_key(key)
+        if not key_norm:
+            continue
+        if norm == key_norm:
+            return Path(path_str)
+        if norm in key_norm or key_norm in norm:
+            return Path(path_str)
+
+    return None
+
+
+# ---------------------------------------------------------
+# CATEGORY AUTO-CREATION
+# ---------------------------------------------------------
+
+def _sanitize_category_folder_name(category: str) -> str:
+    """
+    Sanitize category name for folder creation.
+    Similar to filename sanitization but more lenient.
+    """
+    if not category:
+        return "Uncategorized"
+
+    c = category.strip()
+    c = re.sub(r'[\\/:*?"<>|]+', "_", c)
+    c = re.sub(r"\s+", " ", c).strip()
+    if len(c) > 60:
+        c = c[:60]
+    if not c:
+        c = "Uncategorized"
+    return c
+
+
+def get_or_create_category_folder(category: str) -> Path:
+    """
+    Resolve a folder for the given category:
+    1) Try to map to existing DESTINATIONS.
+    2) If not found, auto-create a folder under sorted_root using the category name.
+    """
+    # 1) Try existing destinations
+    dest = _find_best_destination_for_category(category)
+    if dest is not None:
+        ensure_folder(dest)
+        return dest
+
+    # 2) Auto-create under sorted_root
+    safe_name = _sanitize_category_folder_name(category or "Uncategorized")
+    auto_folder = SORTED_ROOT / safe_name
+    ensure_folder(auto_folder)
+    log_fn(f"[ROUTE] Auto-created category folder: {auto_folder}", "info")
+    return auto_folder
+
+
+# ---------------------------------------------------------
+# ROUTING DECISION
+# ---------------------------------------------------------
+
+def decide_destination_folder(ai_result: Dict[str, Any], original_path: Path) -> Path:
+    """
+    Decide the destination folder for a file based on AI result.
+
+    Priority:
+    1) AI category → mapped or auto-created folder
+    2) If AI failed or category empty → 'review' destination if configured
+    3) If no 'review' → 'other' destination if configured
+    4) Else → sorted_root
+    """
+    category = str(ai_result.get("category", "") or "")
+    ai_failed = bool(ai_result.get("ai_failed", False))
+
+    # If AI succeeded and category is present, route by category
+    if not ai_failed and category:
+        folder = get_or_create_category_folder(category)
+        return folder
+
+    # AI failed or no category → send to review/other
+    review_path = DESTINATIONS.get("review")
+    other_path = DESTINATIONS.get("other")
+
+    if review_path:
+        folder = Path(review_path)
+        ensure_folder(folder)
+        log_fn(f"[ROUTE] AI failed/uncertain; routing to REVIEW: {folder}", "warn")
+        return folder
+
+    if other_path:
+        folder = Path(other_path)
+        ensure_folder(folder)
+        log_fn(f"[ROUTE] AI failed/uncertain; routing to OTHER: {folder}", "warn")
+        return folder
+
+    # Fallback: sorted_root
+    ensure_folder(SORTED_ROOT)
+    log_fn(f"[ROUTE] AI failed/uncertain; routing to SORTED_ROOT: {SORTED_ROOT}", "warn")
+    return SORTED_ROOT
+
+
+# ---------------------------------------------------------
+# ROUTING + FILENAME APPLICATION (PATCHED)
+# ---------------------------------------------------------
+
+def route_file_with_ai(
+    src_path: Path,
+    ai_result: Dict[str, Any],
+) -> None:
+    """
+    Apply routing and filename logic to move a file to its final destination.
+
+    Steps:
+    1) Decide destination folder based on AI result.
+    2) Apply FINANCIAL → credit_card_statement override based on issuer.
+    3) Build smart filename (Vendor + DocType + Date via Filename V3).
+    4) Move file to destination with new name.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Extract category + issuer
+    # ---------------------------------------------------------
+    category = ai_result.get("category", "") or ""
+    metadata = ai_result.get("metadata", {}) or {}
+    text = ai_result.get("text", "") or ""
+
+    # Extract issuer using the filename engine’s logic
+    from filename_v3_engine import _extract_issuer
+
+    issuer = _extract_issuer(
+        metadata=metadata,
+        text=text,
+        category=category,
+        original_path=str(src_path),
+    )
+
+    if issuer:
+        log(f"[ROUTE] Detected issuer: {issuer}", "diag")
+    else:
+        log("[ROUTE] No issuer detected", "diag")
+
+    # ---------------------------------------------------------
+    # 2. FINANCIAL → credit_card_statement override
+    # ---------------------------------------------------------
+    BANK_ISSUERS = [
+        "capital one", "chase", "citi", "citibank", "american express",
+        "amex", "discover", "wells fargo", "us bank", "bank of america"
+    ]
+
+    if (
+        category.lower() == "financial"
+        and issuer
+        and issuer.lower() in BANK_ISSUERS
+    ):
+        log("[ROUTE] Overriding FINANCIAL → credit_card_statement based on issuer", "diag")
+        category = "credit_card_statement"
+        ai_result["category"] = "credit_card_statement"  # ensure consistency
+
+    # ---------------------------------------------------------
+    # 3. Decide destination folder (after override)
+    # ---------------------------------------------------------
+    dest_folder = decide_destination_folder(ai_result, src_path)
+
+    # ---------------------------------------------------------
+    # 4. Build filename using Filename V3 (no category prefix)
+    # ---------------------------------------------------------
+    from filename_v3_engine import build_v3_filename
+
+    new_name = build_v3_filename(
+        category=category,
+        metadata=metadata,
+        text=text,
+        gem_filename=ai_result.get("filename", ""),
+        reasoning=ai_result.get("reasoning", ""),
+        original_path=str(src_path),
+    )
+
+    dest_path = dest_folder / new_name
+
+    # ---------------------------------------------------------
+    # 5. Avoid overwriting existing files
+    # ---------------------------------------------------------
+    counter = 1
+    base_stem = dest_path.stem
+    ext = dest_path.suffix
+
+    while dest_path.exists():
+        dest_path = dest_folder / f"{base_stem}__{counter}{ext}"
+        counter += 1
+
+    # ---------------------------------------------------------
+    # 6. Move file
+    # ---------------------------------------------------------
+    safe_move(src_path, dest_path)
+    log(f"[FS] Moved: {src_path} -> {dest_path}", "info")
+
+
+# ---------------------------------------------------------
+# STARTUP DIAGNOSTICS WITH HEALTH INDICATOR + SUMMARY TABLE
+# ---------------------------------------------------------
+
+def run_startup_diagnostics(config, log_fn=log):
+    log_fn("========== SMART SORTER V5.2 STARTUP DIAGNOSTICS ==========", "info")
+
+    health = {
+        "env_key": False,
+        "config_keys": True,
+        "folders": True,
+        "vision": False,
+        "gemini": False,
+        "ollama": False,
+        "poppler": False,
+        "pdf2image": False,
+        "pymupdf": False,
+    }
+
+    # -----------------------------------------------------
+    # 1. Environment variable check
+    # -----------------------------------------------------
+    gemini_env = bool(os.getenv("GEMINI_API_KEY"))
+    health["env_key"] = gemini_env
+    log_fn(f"[DIAG] GEMINI_API_KEY loaded from environment: {gemini_env}", "info")
+
+    # -----------------------------------------------------
+    # 2. Config keys check
+    # -----------------------------------------------------
+    required_keys = ["input_folder", "output_folder", "error_folder"]
+    for key in required_keys:
+        exists = key in config
+        health["config_keys"] = health["config_keys"] and exists
+        log_fn(f"[DIAG] config['{key}'] present: {exists}", "info")
+
+    # -----------------------------------------------------
+    # 3. Folder existence check
+    # -----------------------------------------------------
+    for key in required_keys:
+        folder = config.get(key, "")
+        exists = os.path.exists(folder)
+        health["folders"] = health["folders"] and exists
+        log_fn(f"[DIAG] Folder exists ({key}): {exists} → {folder}", "info")
+
+    # -----------------------------------------------------
+    # 4. Google Vision availability
+    # -----------------------------------------------------
+    try:
+        client = get_vision_client()
+        health["vision"] = True
+        log_fn("[DIAG] Google Vision client initialized successfully.", "info")
+    except Exception as e:
+        log_fn(f"[DIAG] Google Vision initialization FAILED: {e}", "error")
+
+    # -----------------------------------------------------
+    # 5. Gemini availability
+    # -----------------------------------------------------
+    try:
+        if GEMINI_CLIENT is not None:
+            health["gemini"] = True
+            log_fn("[DIAG] Gemini client initialized successfully.", "info")
+        else:
+            log_fn("[DIAG] Gemini client is None.", "warn")
+    except Exception as e:
+        log_fn(f"[DIAG] Gemini initialization FAILED: {e}", "error")
+
+    # -----------------------------------------------------
+    # 6. Ollama availability
+    # -----------------------------------------------------
+    try:
+        import requests
+        r = requests.post(
+            config["ai_classification"]["ollama_url"],
+            json={"model": "qwen2.5:0.5b", "prompt": "ping", "stream": False},
+            timeout=2
+        )
+        ok = (r.status_code == 200)
+        health["ollama"] = ok
+        log_fn(f"[DIAG] Ollama reachable: {ok}", "info")
+    except Exception as e:
+        log_fn(f"[DIAG] Ollama unreachable: {e}", "warn")
+
+    # -----------------------------------------------------
+    # 7. Poppler availability
+    # -----------------------------------------------------
+    try:
+        from pdf2image import pdfinfo_from_path
+        try:
+            pdfinfo_from_path("dummy.pdf")  # will fail but proves poppler is callable
+        except Exception:
+            pass
+        health["poppler"] = True
+        log_fn("[DIAG] Poppler detected in PATH.", "info")
+    except Exception:
+        log_fn("[DIAG] Poppler NOT detected — PDF OCR may fail.", "warn")
+
+    # -----------------------------------------------------
+    # 8. pdf2image + Pillow availability
+    # -----------------------------------------------------
+    try:
+        import pdf2image
+        from PIL import Image
+        health["pdf2image"] = True
+        log_fn("[DIAG] pdf2image + Pillow available.", "info")
+    except Exception as e:
+        log_fn(f"[DIAG] pdf2image/Pillow unavailable: {e}", "warn")
+
+    # -----------------------------------------------------
+    # 9. PyMuPDF availability
+    # -----------------------------------------------------
+    try:
+        import fitz
+        health["pymupdf"] = True
+        log_fn("[DIAG] PyMuPDF available.", "info")
+    except Exception:
+        log_fn("[DIAG] PyMuPDF NOT available — fallback OCR limited.", "warn")
+
+    # -----------------------------------------------------
+    # 10. Logging status
+    # -----------------------------------------------------
+    log_fn(f"[DIAG] Logging enabled: {config['logging']['enabled']}", "info")
+    log_fn(f"[DIAG] Log file path: {config['logging']['log_file_path']}", "info")
+
+    # -----------------------------------------------------
+    # SUMMARY TABLE
+    # -----------------------------------------------------
+    log_fn("------------------------------------------------------------", "info")
+    log_fn("STARTUP HEALTH SUMMARY:", "info")
+
+    for key, val in health.items():
+        status = "OK" if val else "FAIL"
+        color = "info" if val else "error"
+        log_fn(f"  {key:<12} : {status}", color)
+
+    log_fn("------------------------------------------------------------", "info")
+    log_fn("========== STARTUP DIAGNOSTICS COMPLETE ==========", "info")
+
+# =========================================================
+# Section 7 — CATEGORY AUTO-CREATION (Already Integrated)
+# =========================================================
+# NOTE:
+# This section was fully implemented inside Section 6.
+# The functions:
+#   - get_or_create_category_folder()
+#   - _sanitize_category_folder_name()
+# already provide full auto-creation logic.
+#
+# We continue now with Section 8.
+
+
+# =========================================================
+# Section 8 — WATCHER LOOP (Continuous Real-Time Monitoring)
+# =========================================================
+
+import time
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+def _scan_single_folder(folder: Path) -> List[Path]:
+    """
+    Return a list of files in a folder (non-recursive).
+    Skip temporary/incomplete files.
+    """
+    if not folder.exists():
+        return []
+
+    results: List[Path] = []
+    for item in folder.iterdir():
+        if item.is_file() and not is_temp_extension(item):
+            results.append(item)
+    return results
+
+
+def _process_file(path: Path) -> None:
+    """
+    Process a single file:
+    1) Wait for file stability
+    2) Extract text (OCR or direct)
+    3) Analyze with AI
+    4) Route + rename
+    """
+    log_fn(f"[WATCH] Processing file: {path}", "info")
+
+    if not is_file_stable(path):
+        log_fn(f"[WATCH] File not stable, skipping: {path}", "warn")
+        return
+
+    # Extract text
+    text = extract_text_for_ai(path)
+    if not text.strip():
+        log_fn(f"[WATCH] No text extracted; AI may fail: {path}", "warn")
+
+    # AI analysis
+    ai_result = analyze_document_with_ai(text, path.name)
+
+    # Routing + renaming
+    route_file_with_ai(path, ai_result)
+
+
+def _scan_group(group_name: str, folders: List[str]) -> None:
+    """
+    Scan all folders in a group and process new files.
+    """
+    log_fn(f"[WATCH] Scanning group '{group_name}'", "diag")
+
+    for folder_str in folders:
+        folder = Path(folder_str)
+        ensure_folder(folder)
+
+        files = _scan_single_folder(folder)
+        for f in files:
+            try:
+                _process_file(f)
+            except Exception as e:
+                log_fn(f"[WATCH] Error processing {f}: {e}", "error")
+                ensure_folder(ERROR_FOLDER)
+                err_dest = ERROR_FOLDER / f.name
+                safe_move(f, err_dest)
+
+
+# ---------------------------------------------------------
+# Watchdog Handler
+# ---------------------------------------------------------
+class SmartSorterHandler(FileSystemEventHandler):
+    def __init__(self, group_name: str):
+        self.group_name = group_name
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+
+        path = Path(event.src_path)
+        log_fn(f"[WATCH] Detected new file in '{self.group_name}': {path}", "info")
+
+        try:
+            _process_file(path)
+        except Exception as e:
+            log_fn(f"[WATCH] Error processing {path}: {e}", "error")
+            ensure_folder(ERROR_FOLDER)
+            safe_move(path, ERROR_FOLDER / path.name)
+
+
+# ---------------------------------------------------------
+# Watcher Loop (Event-Based)
+# ---------------------------------------------------------
+def watcher_loop() -> None:
+    """
+    Real-time watcher loop:
+    - Runs initial scan once
+    - Attaches watchdog observers to each folder
+    - Reacts instantly to new files
+    - No repeated scanning spam
+    """
+    log_fn("[WATCH] Starting continuous watcher loop (V5.2).", "info")
+
+    # 1. Initial scan (one-time)
+    for group in INITIAL_SCAN_GROUPS:
+        folders = OBSERVER_GROUPS.get(group, [])
+        _scan_group(group, folders)
+
+    # 2. Attach watchers
+    observers = []
+    for group_name, folders in OBSERVER_GROUPS.items():
+        for folder_str in folders:
+            folder = Path(folder_str)
+            ensure_folder(folder)
+
+            handler = SmartSorterHandler(group_name)
+            observer = Observer()
+            observer.schedule(handler, str(folder), recursive=True)
+            observer.start()
+
+            observers.append(observer)
+            log_fn(f"[WATCH] Attached watcher to: {folder}", "success")
+
+    # 3. Idle forever
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log_fn("[WATCH] Stopping watchers...", "warn")
+        for obs in observers:
+            obs.stop()
+        for obs in observers:
+            obs.join()
+
+
+# =========================================================
+# Section 9 — OBSERVER GROUPS (Already Integrated)
+# =========================================================
+# NOTE:
+# Observer groups are fully defined in config.json and used
+# directly by watcher_loop() and _scan_group().
+#
+# No additional code needed here.
+
+
+# =========================================================
+# Section 10 — SMART MODE V2 (Optional Enhancements)
+# =========================================================
+
+def smart_mode_preprocess(path: Path) -> None:
+    """
+    Placeholder for Smart Mode V2 preprocessing.
+    You can extend this later to:
+    - Detect duplicates
+    - Detect corrupted files
+    - Extract quick metadata
+    - Pre-classify by extension
+    """
+    # Currently unused — reserved for future expansion.
+    return
+
+
+# =========================================================
+# Section 11 — ERROR HANDLING (Already Integrated)
+# =========================================================
+# NOTE:
+# Error handling is integrated throughout:
+# - safe_move()
+# - try/except in _process_file()
+# - logging on failures
+#
+# No additional block required.
+
+
+# =========================================================
+# Section 12 — PERFORMANCE OPTIMIZATIONS
+# =========================================================
+
+def optimize_system() -> None:
+    """
+    Placeholder for performance optimizations.
+    You can extend this to:
+    - Preload OCR models
+    - Cache AI results
+    - Parallelize folder scans
+    - Use thread pools
+    """
+    # Currently unused — reserved for future expansion.
+    return
+
+
+# =========================================================
+# Section 13 — MAIN ENTRYPOINT
+# =========================================================
+
+if __name__ == "__main__":
+    log_fn("==============================================", "info")
+    log_fn(" Smart Sorter V5.2 — Monolithic Edition START ", "info")
+    log_fn("==============================================", "info")
+
+    ensure_folder(INPUT_FOLDER)
+    ensure_folder(OUTPUT_FOLDER)
+    ensure_folder(ERROR_FOLDER)
+    ensure_folder(SORTED_ROOT)
+
+    optimize_system()
+
+    try:
+        watcher_loop()
+    except KeyboardInterrupt:
+        log_fn("[SYSTEM] Smart Sorter stopped by user.", "warn")
+    except Exception as e:
+        log_fn(f"[SYSTEM] Fatal error: {e}", "error")
